@@ -14,7 +14,8 @@ open dist/YesHarness.app
 scripts/bundle.sh --install   # or: copy it to /Applications
 ```
 
-Needs Rust (`cargo`) and Xcode command line tools (`swiftc`, for the voice helper).
+Needs Rust (`cargo`) and Xcode command line tools (Swift, for the voice helper in `helper/`, a Swift package
+that pulls in FluidAudio on first build).
 
 ## How it works
 
@@ -66,9 +67,13 @@ hands it out to the specialists, then tells you how it went.
   Space or click the speaker icon.
 - **No runaway agents:** every agent run has a small watchdog. If the app quits, crashes or is force-quit,
   the run is stopped within a couple of seconds.
-- **Speech engine:** on macOS 26+ it's Apple's on-device `SpeechAnalyzer`, which streams while you talk. A
-  6-second sentence takes about 0.6 s in total. It's private, works offline, and needs no Python, Whisper or
-  downloads. Older macOS uses `SFSpeechRecognizer`. Agent, channel and file names are passed in as vocabulary.
+- **Speech engine** (Settings → Voice → Recognition):
+  - **Apple** (default): built into macOS (`SpeechAnalyzer` on macOS 26+). Live text as you speak, nothing to
+    download, and agent and channel names are given as vocabulary hints.
+  - **Parakeet Ultra**: NVIDIA's Parakeet TDT (moondream's "Ultra" post-training) running on the Neural Engine
+    through [FluidAudio](https://github.com/FluidInference/FluidAudio). One-time setup of about 0.7 GB. Apple stays
+    in use until it's ready. In a five-clip test it made half as many mistakes as Apple's recognizer (2.2% vs 4.5%
+    words wrong), at a similar speed (~0.5 s per sentence). Live text comes from re-transcribing about every 0.6 s.
 - The ⌨ button shows a text box if you do want to type.
 
 ### Agents pick themselves

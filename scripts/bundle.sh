@@ -4,11 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "› Building app (release)…"
-cargo build --release
+cargo build --locked --release
 
 echo "› Building voice helper…"
-swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13" helper/dictate.swift -o target/release/yh-dictate \
-  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker helper/Info.plist
+swift build -c release --package-path helper
+cp helper/.build/release/yh-dictate target/release/yh-dictate
 
 APP=dist/YesHarness.app
 rm -rf "$APP"

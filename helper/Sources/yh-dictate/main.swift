@@ -1,4 +1,6 @@
-// yh-dictate: fast on-device speech-to-text for YesHarness. Nothing to install.
+// yh-dictate: fast on-device speech-to-text for YesHarness.
+//
+// Engines (YH_ENGINE): "apple" (default; nothing to install) or "parakeet" (Parakeet Ultra, downloaded once).
 //
 // macOS 26+: Apple's SpeechAnalyzer + SpeechTranscriber (new, fast, long-form, on-device).
 // Older macOS: SFSpeechRecognizer (on-device when supported).
@@ -414,7 +416,13 @@ final class Legacy {
     }
 }
 
-if #available(macOS 26, *), SpeechTranscriber.isAvailable {
+if env["YH_ENGINE"] == "parakeet" {
+    // NVIDIA Parakeet Ultra via FluidAudio (see Parakeet.swift).
+    let p = Parakeet()
+    p.mic.lastLoud = .distantPast
+    p.run()
+    withExtendedLifetime(p) { dispatchMain() }
+} else if #available(macOS 26, *), SpeechTranscriber.isAvailable {
     let m = Modern()
     m.run()
     withExtendedLifetime(m) { dispatchMain() }

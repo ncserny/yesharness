@@ -953,6 +953,19 @@ mod tests {
         data.channels[0].messages.iter().map(|m| (format!("{:?}", m.author), m.text.clone())).collect()
     }
 
+    /// Exercise the native cmd /C execution branch, including stdin and stdout.
+    #[cfg(windows)]
+    #[test]
+    fn windows_custom_command_replies() {
+        let lead = agent("L", "lead", "more >nul & echo WINDOWS_OK");
+        let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "hello".into());
+        let msgs = wait(&shared);
+        assert_eq!(msgs.last().unwrap().1, "WINDOWS_OK");
+        assert!(!shared.data.lock().unwrap().channels[0].messages.last().unwrap().error);
+    }
+
     #[test]
     fn finds_delegations() {
         let m = vec![agent("a", "claude", ""), agent("b", "codex", "")];
@@ -991,6 +1004,7 @@ mod tests {
 
     /// Real processes: a lead that delegates to a helper, then wraps up.
     #[test]
+    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn lead_delegates_then_wraps_up() {
         let lead = agent(
             "L",
@@ -1011,6 +1025,7 @@ mod tests {
 
     /// Two teammates briefed in one message work at the same time.
     #[test]
+    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn handoffs_run_in_parallel() {
         // Each helper marks that it started, waits, then checks whether the other one started too.
         // Run one after another, neither would see the other; in parallel, both do.
@@ -1055,6 +1070,7 @@ mod tests {
 
     /// The main agent creates a channel and hands the work over; the team there starts on it.
     #[test]
+    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn main_agent_creates_channel_and_hands_over() {
         let dir = std::env::temp_dir().join(format!("yh-newch-{}", model::new_id()));
         let lead = agent(
@@ -1129,6 +1145,7 @@ mod tests {
 
     /// "Everyone" with one agent out of quota: the other answers once, not twice.
     #[test]
+    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn stand_in_answers_once() {
         let lead = agent("L", "lead", r#"cat >/dev/null; echo "You've hit your usage limit" >&2; exit 1"#);
         let backup = agent("B", "backup", r#"cat >/dev/null; echo "backup here""#);
@@ -1141,6 +1158,7 @@ mod tests {
 
     /// The lead is out of quota: the other agent answers instead.
     #[test]
+    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn fails_over_when_lead_hits_its_limit() {
         let lead = agent("L", "lead", r#"cat >/dev/null; echo "You've hit your usage limit" >&2; exit 1"#);
         let backup = agent("B", "backup", r#"cat >/dev/null; echo "backup here""#);

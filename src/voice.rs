@@ -59,11 +59,94 @@ pub fn prepare() {
     }
 }
 
+// ------------------------------------------------------------------ Parakeet Ultra (optional engine)
+
+/// Setting up Parakeet (download + first load), reported to the Settings sheet.
+#[derive(Clone, Default)]
+pub struct Setup {
+    pub running: bool,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+static SETUP: Mutex<Setup> = Mutex::new(Setup { running: false, status: String::new(), error: None });
+
+fn parakeet_dir() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("FluidAudio/Models/parakeet-ultra"))
+}
+
+/// Downloaded and loaded successfully at least once.
+pub fn parakeet_ready() -> bool {
+    !SETUP.lock().unwrap().running && parakeet_dir().is_some_and(|d| d.join(".yesharness-ready").is_file())
+}
+
+pub fn parakeet_setup() -> Setup {
+    SETUP.lock().unwrap().clone()
+}
+
+/// Download and load Parakeet Ultra in the background (once). Safe to call repeatedly.
+pub fn setup_parakeet(repaint: impl Fn() + Send + 'static) {
+    {
+        let mut s = SETUP.lock().unwrap();
+        if s.running || parakeet_dir().is_some_and(|d| d.join(".yesharness-ready").is_file()) {
+            return;
+        }
+        *s = Setup { running: true, status: "Setting up Parakeet Ultra (one time, ~0.7 GB)…".into(), error: None };
+    }
+    let Some(helper) = helper_path() else {
+        *SETUP.lock().unwrap() = Setup { running: false, status: String::new(), error: Some("Voice helper not found.".into()) };
+        return;
+    };
+    std::thread::spawn(move || {
+        let child = Command::new(helper)
+            .arg("--prepare")
+            .env("YH_ENGINE", "parakeet")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let mut ok = false;
+        let mut error = None;
+        if let Ok(mut child) = child {
+            if let Some(out) = child.stdout.take() {
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    if let Some(i) = line.strip_prefix("I:") {
+                        if i == "ready" {
+                            ok = true;
+                        } else {
+                            SETUP.lock().unwrap().status = i.replace("Downloading", "Setting up");
+                        }
+                    } else if let Some(e) = line.strip_prefix("E:") {
+                        error = Some(e.to_string());
+                    }
+                    repaint();
+                }
+            }
+            let _ = child.wait();
+        } else {
+            error = Some("Couldn't start the voice helper.".into());
+        }
+        if ok {
+            if let Some(d) = parakeet_dir() {
+                let _ = std::fs::write(d.join(".yesharness-ready"), "ok");
+            }
+        }
+        *SETUP.lock().unwrap() = Setup {
+            running: false,
+            status: if ok { "Ready".into() } else { String::new() },
+            error: if ok { None } else { Some(error.unwrap_or_else(|| "Setup didn't finish.".into())) },
+        };
+        repaint();
+    });
+}
+
 impl Dictation {
     /// `words`: names to recognise better (agents, channels, files).
-    pub fn start(mode: Mode, words: &[String], repaint: impl Fn() + Send + 'static) -> Result<Self, String> {
+    /// `engine`: "apple" or "parakeet".
+    pub fn start(mode: Mode, words: &[String], engine: &str, repaint: impl Fn() + Send + 'static) -> Result<Self, String> {
         let path = helper_path().ok_or("Voice helper not found. Build the app with scripts/bundle.sh.")?;
         let mut cmd = Command::new(path);
+        cmd.env("YH_ENGINE", engine);
         if mode == Mode::HandsFree {
             cmd.arg("--hands-free");
         }

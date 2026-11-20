@@ -182,6 +182,13 @@ pub struct Settings {
     /// "auto" (follow macOS), "light" or "dark".
     #[serde(default = "auto_theme")]
     pub theme: String,
+    /// Speech recognition: "apple" (built in) or "parakeet" (Parakeet Ultra, downloaded once).
+    #[serde(default = "apple_engine")]
+    pub stt_engine: String,
+}
+
+fn apple_engine() -> String {
+    "apple".into()
 }
 
 fn auto_theme() -> String {
@@ -201,7 +208,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme() }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: apple_engine() }
     }
 }
 

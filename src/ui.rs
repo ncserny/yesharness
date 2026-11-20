@@ -33,6 +33,8 @@ pub struct App {
     pressed_at: Option<Instant>,
     mic_was_down: bool,
     voice_error: Option<String>,
+    /// Which speech engine the running dictation uses.
+    voice_engine: String,
     /// Channel whose full history is shown (others show the latest messages only).
     show_all: Option<String>,
     /// Text-box mode: the part of the composer that live dictation owns.
@@ -141,6 +143,10 @@ impl App {
         heartbeat::start(shared.clone());
         crate::inbox::start(shared.clone());
         voice::prepare();
+        if shared.data.lock().unwrap().settings.stt_engine == "parakeet" {
+            let c = ctx.clone();
+            voice::setup_parakeet(move || c.request_repaint());
+        }
 
         // Ctrl+Option+Space from any app: hold to talk to the current channel.
         let (tx, hotkey_rx) = mpsc::channel();
@@ -161,6 +167,7 @@ impl App {
             pressed_at: None,
             mic_was_down: false,
             voice_error: None,
+            voice_engine: String::new(),
             show_all: None,
             live: None,
             skip_next_utterance: false,
@@ -206,9 +213,23 @@ impl App {
         }
         self.voice_error = None;
         let c = ctx.clone();
-        match Dictation::start(mode, &self.vocabulary(), move || c.request_repaint()) {
-            Ok(d) => self.dictation = Some(d),
+        let engine = self.engine();
+        match Dictation::start(mode, &self.vocabulary(), &engine, move || c.request_repaint()) {
+            Ok(d) => {
+                self.dictation = Some(d);
+                self.voice_engine = engine;
+            }
             Err(e) => self.voice_error = Some(e),
+        }
+    }
+
+    /// The engine to use right now: Parakeet once it's set up, otherwise Apple's.
+    fn engine(&self) -> String {
+        let wanted = self.shared.data.lock().unwrap().settings.stt_engine.clone();
+        if wanted == "parakeet" && voice::parakeet_ready() {
+            "parakeet".into()
+        } else {
+            "apple".into()
         }
     }
 
@@ -276,6 +297,12 @@ impl App {
             let d = self.shared.data.lock().unwrap();
             (d.settings.hands_free, d.settings.show_keyboard)
         };
+        // Engine changed (you switched it, or Parakeet just finished setting up): restart listening.
+        if let Some(d) = &self.dictation {
+            if d.mode == Mode::HandsFree && self.voice_engine != self.engine() {
+                self.dictation = None;
+            }
+        }
         // Always-listening is a setting: keep it running (unless it just failed).
         if hands_free && self.dictation.is_none() && self.voice_error.is_none() {
             self.start_voice(Mode::HandsFree, ctx);
@@ -1667,6 +1694,34 @@ impl App {
                                 voice::speak("This is how fast I'll talk.", &voice::auto_voice(0));
                             }
                         });
+                        form_sep(ui, t);
+                        form_row(ui, t, "Recognition", |ui| {
+                            let cur = if data.settings.stt_engine == "parakeet" { 1 } else { 0 };
+                            if let Some(i) = segmented(ui, t, cur, &["Apple", "Parakeet Ultra"]) {
+                                data.settings.stt_engine = if i == 1 { "parakeet".into() } else { "apple".into() };
+                                if i == 1 {
+                                    let c = ctx.clone();
+                                    voice::setup_parakeet(move || c.request_repaint());
+                                }
+                            }
+                        });
+                        let setup = voice::parakeet_setup();
+                        let note = if data.settings.stt_engine != "parakeet" {
+                            "Built into macOS: live text as you speak, nothing to download.".to_string()
+                        } else if let Some(e) = &setup.error {
+                            format!("Parakeet couldn't be set up: {e} Using Apple meanwhile.")
+                        } else if setup.running {
+                            format!("{} Using Apple until it's ready.", setup.status)
+                        } else if voice::parakeet_ready() {
+                            "NVIDIA Parakeet Ultra on the Neural Engine: fewer mistakes, especially with names and terms.".to_string()
+                        } else {
+                            "Setting up…".to_string()
+                        };
+                        ui.add(egui::Label::new(RichText::new(note).size(11.5).color(if setup.error.is_some() { t.red } else { t.secondary })).wrap());
+                        if setup.error.is_some() && data.settings.stt_engine == "parakeet" && ui.button("Try Again").clicked() {
+                            let c = ctx.clone();
+                            voice::setup_parakeet(move || c.request_repaint());
+                        }
                         form_sep(ui, t);
                         let natural = voice::natural_voices();
                         form_row(ui, t, "Natural voices", |ui| {

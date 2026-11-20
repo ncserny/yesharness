@@ -34,10 +34,10 @@ Interactive layout and voice checks remain pending: the sandboxed preview could 
 
 Before announcing Linux/Windows support:
 
-1. Build and test natively on each OS (Linux X11 and Wayland separately). Install the platform development libraries required by eframe/rfd; the project has no validated dependency recipe yet.
+1. Build and test natively on each OS (Linux X11 and Wayland separately). Install the platform development libraries required by eframe/rfd; the proposed Ubuntu dependency recipe is in `.github/workflows/ci.yml` and still needs a hosted run.
 2. Exercise CLI discovery, login/model probes, prompt streaming, session resume and stop with a spawned child process. Windows npm command shims and paths with spaces need particular attention. Existing shell-based test fixtures also need Windows equivalents.
 3. Verify folder dialogs, state persistence and heartbeat file changes.
-4. Add packaging and CI. Implement notifications and choose voice backends if feature parity is required.
+4. Execute the prepared CI workflow and validate its development artifacts. Add Linux/Windows installers and release signing/notarization as needed. Implement notifications and choose voice backends if feature parity is required.
 
 A native checkout can attempt `cargo build --release` and `cargo test`; `scripts/bundle.sh` is macOS-only. This is a development starting point, not a claim of supported distribution.
 
@@ -46,3 +46,19 @@ A native checkout can attempt `cargo build --release` and `cargo test`; `scripts
 Quit the running app when its agents are idle, then open `dist/YesHarness.app` from this project. The running app does not hot-reload Rust UI changes. No `/Applications` install or running-session restart was performed.
 
 Check channel switching, Team and channel menus, typing/Enter/Shift+Enter, microphone tap/hold, listening modes, read-aloud/Quiet, and Stop agents. Resize to the minimum window size to check wrapping. Use `YH_DATA_FILE` with a separate JSON file for an isolated preview; the normal state location is unchanged.
+
+## CI preparation — 2026-11-21
+
+`.github/workflows/ci.yml` runs on pushes, pull requests, and manual dispatch. Its independent native jobs use macOS 26 ARM64, Ubuntu 24.04 x64, and Windows 2025 x64, Rust 1.86.0 (the declared minimum), and the checked-in Cargo.lock. Each job runs `cargo test --locked --all-targets` and `cargo build --locked --release`. No live model credentials are required. The Ollama integration test remains opt-in.
+
+The macOS job additionally builds the Swift package helper, checks the app signature, and archives the ad-hoc-signed app. Linux archives the executable with its execute permission; Windows uploads the executable. These are development artifacts, not installers or verified releases. The Linux binary still depends on the target system's desktop libraries. Jobs use read-only repository permissions and do not publish releases or deploy anything.
+
+Five orchestration tests use Unix shell fixtures and are explicitly ignored on Windows: delegation/wrap-up, parallel handoffs, new-channel handoff, stand-in deduplication, and quota failover. A Windows-only smoke test exercises `cmd /C`, stdin, and a reply through the real custom-agent path. Windows equivalents for the five richer scenarios, child-process termination, npm shims, and path quoting remain outstanding. The Unix watchdog test is also Unix-only. Shared parsing, routing, model/state, and UI helper tests still run on Windows.
+
+Local evidence: Rust 1.86.0 on Apple Silicon passed `cargo test --offline --locked --all-targets` (31 passed, 1 ignored) and the locked release build. Workflow YAML parsing and `bash -n scripts/bundle.sh` passed; actionlint is not installed. Only the macOS Rust target is installed here, so no Linux/Windows execution or cross-build pass is claimed.
+
+The bundling script now propagates Swift build failures instead of hiding them and potentially copying a stale helper. The current Swift-package-based helper could not be rebuilt in this session: its default module cache is outside writable paths; relocating the module cache into target/ then reached `sandbox-exec: sandbox_apply: Operation not permitted`. Thus this run verified the Rust release binary, not a fresh full app bundle. Earlier bundle results above describe the source and helper used at that time.
+
+Hosted execution is pending publication, which remains blocked by this session's Git/network/write permissions. Interactive X11, Wayland, Windows, macOS voice, and live engine checks remain separate requirements.
+
+Workflow references: [GitHub runner labels](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), [eframe Linux dependencies](https://github.com/emilk/egui/blob/main/crates/eframe/README.md), [checkout action](https://github.com/actions/checkout), and [artifact uploads](https://github.com/actions/upload-artifact).
