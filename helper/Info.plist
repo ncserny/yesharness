@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>io.yesharness.dictate</string>
+    <key>CFBundleName</key><string>YesHarness Dictation</string>
+    <key>NSMicrophoneUsageDescription</key><string>YesHarness listens while you talk to your agents (push-to-talk or hands-free).</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>YesHarness turns your voice into text on this Mac so you can talk to your agents.</string>
+</dict>
+</plist>

@@ -1,0 +1,1159 @@
+//! How agents work together in a channel.
+//!
+//! 1. Your message goes to the lead agent (first available member), or to whoever you address:
+//!    `@codex …`, or by voice "Codex, …" (`@all` / "everyone, …" = every agent).
+//! 2. An agent can hand off work by writing a line `@other: <task>`. The app runs that
+//!    agent, posts its reply in the channel, then gives the turn back to the delegator to
+//!    check the work and answer you.
+//! 3. Each agent resumes its own CLI session per channel, and is shown only the channel
+//!    messages it hasn't seen yet, so everyone stays in sync without re-sending history.
+//! 4. Models are picked automatically from what each CLI reports (see probe.rs). If an agent
+//!    is logged out or out of quota, another agent takes over.
+
+use crate::agents::{self, Ctl};
+use crate::env;
+use crate::model::{self, Agent, AgentKind, Author, Channel, Data, Message};
+use crate::voice;
+use crate::probe::{self, Failure, Health};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
+
+/// Max agent turns per user message, so agents can't ping-pong forever.
+const MAX_TURNS: u32 = 10;
+/// Max nesting of delegations (A asks B asks C ...).
+const MAX_DEPTH: u32 = 2;
+/// How many messages a fresh agent (no session yet) gets as context.
+const HISTORY: usize = 30;
+const MAX_MSG_CHARS: usize = 8000;
+
+pub struct Run {
+    pub cancel: Arc<AtomicBool>,
+    /// One slot per agent turn in flight (handoffs run in parallel); Stop kills them all.
+    pub pids: Arc<Mutex<Vec<Arc<Mutex<Option<u32>>>>>>,
+    /// Who's working right now and what they're doing, in the order they started.
+    pub working: Vec<(String, String)>,
+    pub started: Instant,
+    pub queue: VecDeque<String>,
+}
+
+type Hook<T> = Box<dyn Fn(T) + Send + Sync>;
+
+pub struct Shared {
+    pub data: Mutex<Data>,
+    pub runs: Mutex<HashMap<String, Run>>,
+    pub dirty: AtomicBool,
+    /// What each agent kind can do right now (login, models, limits).
+    pub health: Mutex<HashMap<String, Health>>,
+    /// Channel id -> agents that ran since the last heartbeat.
+    pub activity: Mutex<HashMap<String, BTreeSet<String>>>,
+    pub last_beat: Mutex<Option<Instant>>,
+    /// Channel id -> what's in its project folder (Git/GitHub, AGENTS.md, TASKS.md, docs).
+    pub project: Mutex<HashMap<String, crate::project::ProjectInfo>>,
+    /// Is the app window focused? (Notifications only when it isn't.)
+    pub app_focused: AtomicBool,
+    /// Send () to run the heartbeat now.
+    pub wake: (Mutex<mpsc::Sender<()>>, Arc<Mutex<mpsc::Receiver<()>>>),
+    pub repaint: Box<dyn Fn() + Send + Sync>,
+    /// (text, voice) to read aloud.
+    pub speak: Hook<(String, String)>,
+    pub notify: Hook<String>,
+    /// Agent id -> stand-in engine we already told the user about.
+    pub engine_notes: Mutex<HashMap<String, AgentKind>>,
+}
+
+impl Shared {
+    pub fn new(data: Data, repaint: Box<dyn Fn() + Send + Sync>, speak: Hook<(String, String)>, notify: Hook<String>) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel();
+        Arc::new(Shared {
+            data: Mutex::new(data),
+            runs: Mutex::new(HashMap::new()),
+            dirty: AtomicBool::new(false),
+            health: Mutex::new(HashMap::new()),
+            activity: Mutex::new(HashMap::new()),
+            last_beat: Mutex::new(None),
+            project: Mutex::new(HashMap::new()),
+            app_focused: AtomicBool::new(true),
+            wake: (Mutex::new(tx), Arc::new(Mutex::new(rx))),
+            repaint,
+            speak,
+            notify,
+            engine_notes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn quiet(data: Data) -> Arc<Self> {
+        Shared::new(data, Box::new(|| {}), Box::new(|_: (String, String)| {}), Box::new(|_| {}))
+    }
+
+    pub fn post(&self, cid: &str, author: Author, text: String, error: bool) {
+        if let Some(ch) = self.data.lock().unwrap().channel_mut(cid) {
+            ch.messages.push(Message { author, text, ts: model::now(), error, to_user: false, via: String::new() });
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        (self.repaint)();
+    }
+
+    fn set_status(&self, cid: &str, agent: &str, status: String) {
+        if let Some(r) = self.runs.lock().unwrap().get_mut(cid) {
+            match r.working.iter_mut().find(|(a, _)| a == agent) {
+                Some(w) => w.1 = status,
+                None => r.working.push((agent.to_string(), status)),
+            }
+        }
+        (self.repaint)();
+    }
+
+    fn done_working(&self, cid: &str, agent: &str) {
+        if let Some(r) = self.runs.lock().unwrap().get_mut(cid) {
+            r.working.retain(|(a, _)| a != agent);
+        }
+        (self.repaint)();
+    }
+
+    fn cancelled(&self, cid: &str) -> bool {
+        self.runs.lock().unwrap().get(cid).map(|r| r.cancel.load(Ordering::Relaxed)).unwrap_or(true)
+    }
+
+    /// Re-read a channel's project folder (cheap: a few small files).
+    pub fn refresh_project(&self, cid: &str) {
+        let folder = self.data.lock().unwrap().channel(cid).map(|c| c.folder.clone());
+        if let Some(f) = folder {
+            let info = crate::project::inspect(std::path::Path::new(&f));
+            self.project.lock().unwrap().insert(cid.to_string(), info);
+            (self.repaint)();
+        }
+    }
+
+    pub fn health_of(&self, a: &Agent) -> Option<Health> {
+        self.health.lock().unwrap().get(&probe::key(a)).cloned()
+    }
+
+    /// Unknown health counts as available: we'd rather try than refuse.
+    pub fn available(&self, a: &Agent) -> bool {
+        self.health_of(a).map(|h| h.available()).unwrap_or(true)
+    }
+
+    /// The agent as it should run now: on its own engine, or (for Claude/Codex roles) on the other
+    /// engine if its own is logged out or out of quota. None = nothing can run it.
+    pub fn effective(&self, a: &Agent) -> Option<Agent> {
+        if self.available(a) {
+            return Some(a.clone());
+        }
+        if a.kind == AgentKind::Custom {
+            return None;
+        }
+        model::ENGINES.into_iter().filter(|k| *k != a.kind).find_map(|k| {
+            let mut b = a.clone();
+            b.kind = k;
+            b.model = String::new(); // its model belongs to the other engine
+            // A stand-in must be known-good, not just "unknown".
+            self.health_of(&b).is_some_and(|h| h.available()).then_some(b)
+        })
+    }
+
+    fn why_unavailable(&self, a: &Agent) -> String {
+        self.health_of(a).and_then(|h| h.why_unavailable()).unwrap_or_else(|| "unavailable".into())
+    }
+}
+
+/// Called by the UI when you hit send (or stop talking).
+pub fn send(shared: &Arc<Shared>, cid: &str, text: String) {
+    shared.post(cid, Author::User, text.clone(), false);
+    let mut runs = shared.runs.lock().unwrap();
+    if let Some(run) = runs.get_mut(cid) {
+        // Agents are busy in this channel: handle it right after.
+        run.queue.push_back(text);
+        return;
+    }
+    runs.insert(
+        cid.to_string(),
+        Run {
+            cancel: Arc::new(AtomicBool::new(false)),
+            pids: Arc::new(Mutex::new(Vec::new())),
+            working: Vec::new(),
+            started: Instant::now(),
+            queue: VecDeque::new(),
+        },
+    );
+    drop(runs);
+    let shared = shared.clone();
+    let cid = cid.to_string();
+    std::thread::spawn(move || {
+        let mut next = Some(text);
+        while let Some(t) = next {
+            handle(&shared, &cid, &t);
+            shared.refresh_project(&cid); // agents may have added AGENTS.md, tasks, docs…
+            let mut runs = shared.runs.lock().unwrap();
+            next = match runs.get_mut(&cid) {
+                Some(r) if !r.cancel.load(Ordering::Relaxed) => {
+                    r.started = Instant::now();
+                    r.queue.pop_front()
+                }
+                _ => None,
+            };
+            if next.is_none() {
+                runs.remove(&cid);
+            }
+        }
+        (shared.repaint)();
+    });
+}
+
+pub fn stop(shared: &Arc<Shared>, cid: &str) {
+    let pids: Vec<u32> = {
+        let mut runs = shared.runs.lock().unwrap();
+        let Some(r) = runs.get_mut(cid) else { return };
+        r.cancel.store(true, Ordering::Relaxed);
+        r.queue.clear();
+        for w in r.working.iter_mut() {
+            w.1 = "stopping…".into();
+        }
+        let slots = r.pids.lock().unwrap();
+        slots.iter().filter_map(|p| *p.lock().unwrap()).collect()
+    };
+    for pid in pids {
+        env::kill_tree(pid);
+    }
+}
+
+#[derive(Clone)]
+enum Mode {
+    /// Answering the user directly.
+    User,
+    /// Doing a sub-task another agent handed over.
+    Delegated { from: String },
+    /// Delegates replied; check their work and wrap up.
+    FollowUp,
+}
+
+struct Turns {
+    budget: u32,
+    /// Agents that failed (logged out / out of quota) during this message.
+    failed: Vec<String>,
+    /// Agents that already answered the user for this message (so a stand-in doesn't answer twice).
+    answered: Vec<String>,
+}
+
+fn handle(shared: &Arc<Shared>, cid: &str, text: &str) {
+    let members = {
+        let data = shared.data.lock().unwrap();
+        match data.channel(cid) {
+            Some(ch) => data.members(ch),
+            None => return,
+        }
+    };
+    if members.is_empty() {
+        shared.post(cid, Author::System, "No agents in this channel yet. Add one from the channel header.".into(), true);
+        return;
+    }
+    let mut targets = user_mentions(text, &members);
+    if targets.is_empty() {
+        targets.push(members[0].id.clone());
+    }
+    let turns = Mutex::new(Turns { budget: MAX_TURNS, failed: Vec::new(), answered: Vec::new() });
+    for t in targets {
+        if shared.cancelled(cid) {
+            break;
+        }
+        if turns.lock().unwrap().answered.contains(&t) {
+            continue;
+        }
+        turn(shared, cid, &t, Mode::User, &turns, 0);
+    }
+    if shared.cancelled(cid) {
+        shared.post(cid, Author::System, "Stopped.".into(), false);
+    }
+}
+
+/// Another member that can answer the user instead of `agent_id`.
+fn substitute(shared: &Shared, cid: &str, agent_id: &str, turns: &Turns) -> Option<Agent> {
+    let members = {
+        let data = shared.data.lock().unwrap();
+        data.members(data.channel(cid)?)
+    };
+    members
+        .into_iter()
+        .find(|a| a.id != agent_id && !turns.failed.contains(&a.id) && !turns.answered.contains(&a.id) && shared.effective(a).is_some())
+}
+
+/// "Nobody can work right now" with a reason and a fix per engine, if every engine is known to be down.
+fn outage_report(shared: &Shared) -> Option<String> {
+    let health = shared.health.lock().unwrap();
+    let mut lines = Vec::new();
+    for kind in model::ENGINES {
+        let h = health.get(kind.label())?;
+        let why = h.why_unavailable()?;
+        let fix = match kind {
+            _ if !h.installed => String::new(),
+            AgentKind::Claude if h.logged_in == Some(false) => " Fix: run `claude` in Terminal and type `/login`.".into(),
+            AgentKind::Codex if h.logged_in == Some(false) => " Fix: run `codex login` in Terminal.".into(),
+            AgentKind::Codex => " Codex has its own usage limit, separate from chatting on chatgpt.com.".into(),
+            AgentKind::Local => " Open the Ollama app, or install a model with `ollama pull gpt-oss:20b`.".into(),
+            _ => String::new(),
+        };
+        lines.push(format!("- **{}**: {why}.{fix}", kind.label()));
+    }
+    Some(format!(
+        "Nobody can work right now:\n{}\nAs soon as one is back, just say it again; I check every few minutes (or click ⟳).",
+        lines.join("\n")
+    ))
+}
+
+/// Sessions are per role *and* engine (a Claude session can't be resumed by Codex).
+pub fn session_key(a: &Agent) -> String {
+    format!("{}:{}", a.id, a.kind.label())
+}
+
+/// Say once in the chat that a role is running on a stand-in engine.
+fn note_engine(shared: &Shared, cid: &str, agent: &Agent, eff: &Agent) {
+    let mut notes = shared.engine_notes.lock().unwrap();
+    if eff.kind == agent.kind {
+        notes.remove(&agent.id);
+        return;
+    }
+    if notes.get(&agent.id) == Some(&eff.kind) {
+        return;
+    }
+    notes.insert(agent.id.clone(), eff.kind);
+    drop(notes);
+    let why = shared.why_unavailable(agent);
+    shared.post(cid, Author::System, format!("{} is working on {} for now ({} is {why}).", agent.name(), eff.kind.label(), agent.kind.label()), false);
+}
+
+fn mark_failure(shared: &Shared, eff: &Agent, failure: &Failure) {
+    let mut health = shared.health.lock().unwrap();
+    let h = health.entry(probe::key(eff)).or_insert_with(|| Health { installed: true, ..Default::default() });
+    match failure {
+        Failure::Auth => h.logged_in = Some(false),
+        Failure::Limit if !h.blocked() => {
+            h.blocked_until = Some(model::now() + 15 * 60);
+            h.blocked_reason = Some("usage limit reached".into());
+        }
+        _ => {}
+    }
+}
+
+fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mutex<Turns>, depth: u32) {
+    if shared.cancelled(cid) {
+        return;
+    }
+    if turns.lock().unwrap().budget == 0 {
+        shared.post(cid, Author::System, format!("Paused: the agents used their {MAX_TURNS} turns for this message. Reply to keep going."), false);
+        return;
+    }
+    let Some(agent) = shared.data.lock().unwrap().agent(agent_id).cloned() else { return };
+
+    // Which engine runs this role right now? Its own, or a stand-in if that one is logged out / out of quota.
+    let mut eff = match shared.effective(&agent) {
+        Some(e) => e,
+        None => {
+            let why = shared.why_unavailable(&agent);
+            let sub = substitute(shared, cid, agent_id, &turns.lock().unwrap());
+            match (&mode, sub) {
+                (Mode::User | Mode::FollowUp, Some(sub)) => {
+                    shared.post(cid, Author::System, format!("{} is {why}, so {} is taking this.", agent.name(), sub.name()), false);
+                    turns.lock().unwrap().failed.push(agent.id.clone());
+                    return turn(shared, cid, &sub.id, mode, turns, depth);
+                }
+                (Mode::Delegated { .. }, _) => {
+                    // Tell the delegator, without spending a turn.
+                    shared.post(cid, Author::Agent(agent.id.clone()), format!("I can't help right now: {why}."), true);
+                    return;
+                }
+                _ => {
+                    // Nothing can run it. If we know why, say so plainly instead of failing again.
+                    if let Some(report) = outage_report(shared) {
+                        shared.post(cid, Author::System, report, true);
+                        let s = shared.clone();
+                        std::thread::spawn(move || crate::heartbeat::refresh_health(&s)); // maybe you just logged in
+                        return;
+                    }
+                    agent.clone() // status unknown: try anyway
+                }
+            }
+        }
+    };
+    note_engine(shared, cid, &agent, &eff);
+    {
+        let mut t = turns.lock().unwrap();
+        if t.budget == 0 {
+            return;
+        }
+        t.budget -= 1;
+    }
+    shared.activity.lock().unwrap().entry(cid.to_string()).or_default().insert(agent.handle.clone());
+
+    // Snapshot what we need, then release the lock while the agent works.
+    let (members, folder, sessions, read_aloud, voice_name) = {
+        let data = shared.data.lock().unwrap();
+        let Some(ch) = data.channel(cid) else { return };
+        let idx = data.agents.iter().position(|a| a.id == agent.id).unwrap_or(0);
+        let voice_name = if agent.voice.is_empty() { voice::auto_voice(idx) } else { agent.voice.clone() };
+        (data.members(ch), PathBuf::from(&ch.folder), ch.sessions.clone(), data.settings.read_aloud, voice_name)
+    };
+    if !folder.is_dir() {
+        shared.post(cid, Author::System, format!("The channel folder `{}` doesn't exist. Pick another one in the header.", folder.display()), true);
+        return;
+    }
+    // Our own process slot, so parallel turns can each be stopped.
+    let pid = Arc::new(Mutex::new(None));
+    let cancel = {
+        let runs = shared.runs.lock().unwrap();
+        let Some(r) = runs.get(cid) else { return };
+        r.pids.lock().unwrap().push(pid.clone());
+        r.cancel.clone()
+    };
+    let status = |s: String| shared.set_status(cid, &agent.handle, s);
+    let ctl = Ctl { cancel: &cancel, pid: &pid, status: &status };
+    let prompt_for = |fresh: bool| {
+        let data = shared.data.lock().unwrap();
+        data.channel(cid).map(|ch| build_prompt(ch, &agent, &members, &data, &mode, fresh, read_aloud, shared)).unwrap_or_default()
+    };
+
+    let mut session = if eff.kind.supports_sessions() { sessions.get(&session_key(&eff)).cloned() } else { None };
+    let mut out;
+    let mut used_model;
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        used_model = probe::pick_model(&eff, shared.health_of(&eff).as_ref());
+        let label = used_model.clone().unwrap_or_else(|| "default model".into());
+        shared.set_status(cid, &agent.handle, format!("thinking… ({} · {label})", eff.kind.label()));
+        // `eff` carries the role's identity (handle, briefing) with the engine that's actually available.
+        out = agents::run(&eff, &folder, &prompt_for(session.is_none()), session.as_deref(), used_model.as_deref(), &ctl);
+        if let Some(info) = &out.rate {
+            let mut health = shared.health.lock().unwrap();
+            probe::apply_claude_rate_info(info, health.entry(probe::key(&eff)).or_insert_with(|| Health { installed: true, ..Default::default() }));
+        }
+        if !out.error || cancel.load(Ordering::Relaxed) || tries >= 4 {
+            break;
+        }
+        match probe::classify(&out.text) {
+            Failure::Model(name) => {
+                // That model isn't available on this account: remember, pick another, retry.
+                let bad = name.or(used_model.clone()).unwrap_or_else(|| "default".into());
+                let mut health = shared.health.lock().unwrap();
+                let h = health.entry(probe::key(&eff)).or_insert_with(|| Health { installed: true, ..Default::default() });
+                if h.bad_models.contains(&bad) {
+                    break;
+                }
+                h.bad_models.push(bad.clone());
+                drop(health);
+                shared.set_status(cid, &agent.handle, format!("{bad} isn't available, switching model…"));
+            }
+            f @ (Failure::Auth | Failure::Limit) => {
+                // Logged out / out of quota: same role, other engine.
+                mark_failure(shared, &eff, &f);
+                match shared.effective(&agent).filter(|e| e.kind != eff.kind) {
+                    Some(next) => {
+                        note_engine(shared, cid, &agent, &next);
+                        eff = next;
+                        session = sessions.get(&session_key(&eff)).cloned();
+                    }
+                    None => break,
+                }
+            }
+            Failure::Other if session.is_some() => {
+                // The saved session may be gone (deleted, other machine…). Start fresh once.
+                session = None;
+                shared.set_status(cid, &agent.handle, "retrying with a fresh session…".into());
+            }
+            Failure::Other => break,
+        }
+    }
+    shared.done_working(cid, &agent.handle);
+    if let Some(r) = shared.runs.lock().unwrap().get(cid) {
+        r.pids.lock().unwrap().retain(|p| !Arc::ptr_eq(p, &pid));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let failure = if out.error { probe::classify(&out.text) } else { Failure::Other };
+    if out.error {
+        mark_failure(shared, &eff, &failure);
+    }
+
+    // App actions (/new-channel, /send, /switch) are carried out by the app, not shown as text.
+    let (shown, actions) = if out.error { (out.text.clone(), Vec::new()) } else { app_actions(&out.text) };
+    let shown = if shown.trim().is_empty() && !actions.is_empty() { "On it.".to_string() } else { shown };
+
+    let to_user = matches!(mode, Mode::User | Mode::FollowUp) && !out.error;
+    if matches!(mode, Mode::User) && !out.error {
+        turns.lock().unwrap().answered.push(agent.id.clone());
+    }
+    let via = match (&used_model, eff.kind) {
+        (_, AgentKind::Custom) => String::new(),
+        (Some(m), k) => format!("{} · {m}", k.label()),
+        (None, k) => k.label().to_string(),
+    };
+    {
+        let mut data = shared.data.lock().unwrap();
+        let selected = data.selected.as_deref() == Some(cid);
+        if let Some(ch) = data.channel_mut(cid) {
+            if let Some(s) = &out.session {
+                ch.sessions.insert(session_key(&eff), s.clone());
+            }
+            ch.messages.push(Message {
+                author: Author::Agent(agent.id.clone()),
+                text: shown.clone(),
+                ts: model::now(),
+                error: out.error,
+                to_user,
+                via,
+            });
+            ch.seen.insert(agent.id.clone(), ch.messages.len());
+            if !selected {
+                ch.unread = true;
+            }
+        }
+        if to_user && read_aloud && selected {
+            (shared.speak)((shown.clone(), voice_name));
+        }
+    }
+    shared.dirty.store(true, Ordering::Relaxed);
+    (shared.repaint)();
+    run_app_actions(shared, cid, &actions);
+
+    if out.error {
+        turns.lock().unwrap().failed.push(agent.id.clone());
+        if matches!(failure, Failure::Auth | Failure::Limit) && matches!(mode, Mode::User | Mode::FollowUp) {
+            let sub = substitute(shared, cid, &agent.id, &turns.lock().unwrap());
+            if let Some(sub) = sub {
+                shared.post(cid, Author::System, format!("{} is taking over.", sub.name()), false);
+                turn(shared, cid, &sub.id, Mode::User, turns, depth);
+            }
+        }
+        return;
+    }
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let exclude = match &mode {
+        Mode::Delegated { from } => Some(from.as_str()),
+        _ => None,
+    };
+    let delegates = delegations(&out.text, &members, &agent.id, exclude);
+    if delegates.is_empty() {
+        return;
+    }
+    if delegates.len() == 1 {
+        turn(shared, cid, &delegates[0], Mode::Delegated { from: agent.id.clone() }, turns, depth + 1);
+    } else {
+        // Several teammates briefed at once: they work in parallel, like people would.
+        std::thread::scope(|scope| {
+            for d in &delegates {
+                let from = agent.id.clone();
+                scope.spawn(move || turn(shared, cid, d, Mode::Delegated { from }, turns, depth + 1));
+            }
+        });
+    }
+    if !shared.cancelled(cid) {
+        let next = match mode {
+            // A delegate that sub-delegated reports back to its own delegator afterwards.
+            Mode::Delegated { from } => Mode::Delegated { from },
+            _ => Mode::FollowUp,
+        };
+        turn(shared, cid, &agent.id, next, turns, depth);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: &Mode, fresh: bool, read_aloud: bool, shared: &Shared) -> String {
+    let mut p = String::new();
+    let start;
+    if !fresh {
+        let seen = ch.seen.get(&me.id).copied().unwrap_or(0).min(ch.messages.len());
+        start = seen.max(ch.messages.len().saturating_sub(HISTORY));
+        p.push_str(&format!("## New messages in #{} since your last turn\n\n", ch.name));
+    } else {
+        p.push_str(&preamble(ch, me, members, shared));
+        start = ch.messages.len().saturating_sub(HISTORY);
+        p.push_str("\n## Conversation so far\n\n");
+    }
+    for m in &ch.messages[start..] {
+        let who = match &m.author {
+            Author::User => "User".to_string(),
+            Author::Agent(id) if *id == me.id => "You".to_string(),
+            Author::Agent(id) => data.agent(id).map(|a| a.label()).unwrap_or_else(|| "@agent".into()),
+            Author::Heartbeat => "Heartbeat (file watcher)".to_string(),
+            Author::System => continue,
+        };
+        if m.error {
+            // Tell the others an agent failed (so the lead can take over), without the noise.
+            let first = m.text.lines().next().unwrap_or_default();
+            p.push_str(&format!("**{who}:** (failed, could not do it: {})\n\n", agents::short(first, 200)));
+            continue;
+        }
+        let text: String = if m.text.chars().count() > MAX_MSG_CHARS {
+            format!("{}… [truncated]", m.text.chars().take(MAX_MSG_CHARS).collect::<String>())
+        } else {
+            m.text.clone()
+        };
+        p.push_str(&format!("**{who}:** {text}\n\n"));
+    }
+    let name = |id: &str| data.agent(id).map(|a| a.handle.clone()).unwrap_or_else(|| "agent".into());
+    p.push_str("## Your turn\n");
+    p.push_str(&match mode {
+        Mode::User => "Respond to the user's latest message above.".to_string(),
+        Mode::Delegated { from } => format!(
+            "@{from} handed you a task (the line starting with \"@{me}:\" above, plus anything said since). \
+             Do it, then reply with a short report of what you did and the result. Your reply goes back to @{from}.",
+            from = name(from),
+            me = me.handle
+        ),
+        Mode::FollowUp => "The agents you handed work to have replied above. Check their results. If something is \
+                           missing or wrong, hand it off again; otherwise give the user a short final answer."
+            .to_string(),
+    });
+    if read_aloud && !matches!(mode, Mode::Delegated { .. }) {
+        p.push_str(
+            "\n(Your reply is read aloud to the user. Start with one or two plain spoken sentences that \
+             answer or summarize; put details, code and lists after that.)",
+        );
+    }
+    // The main agent can run the app itself. Repeated every turn so it also reaches ongoing sessions.
+    let is_main = members.first().is_some_and(|m| m.id == me.id);
+    if is_main && !matches!(mode, Mode::Delegated { .. }) {
+        let names: Vec<String> = data.channels.iter().map(|c| format!("#{}", c.name)).collect();
+        p.push_str(&format!(
+            "\n(App actions: you can operate the YesHarness app. Write these on their own lines and the app does them:\n\
+             /new-channel <name> [folder]   creates a project channel (folder defaults to ~/Development/<name>) and opens it\n\
+             /send <channel> <message>      posts a request in that channel so the team there starts on it\n\
+             /switch <channel>              opens a channel\n\
+             Use them whenever the user asks for a channel or a new project; never tell the user to do it themselves. \
+             Existing channels: {}.)",
+            names.join(", ")
+        ));
+    }
+    p
+}
+
+fn preamble(ch: &Channel, me: &Agent, members: &[Agent], shared: &Shared) -> String {
+    let is_main = members.first().map(|a| a.id == me.id).unwrap_or(false);
+    let role = if me.description.is_empty() { me.kind.label().to_string() } else { me.description.clone() };
+    let mut p = format!(
+        "You are @{me}, one of the AI agents in the user's small virtual office (the YesHarness app), in the \
+         channel #{chan}. Your role: {role}\nThe project folder for this channel is {folder} (your working directory).\n",
+        me = me.handle,
+        chan = ch.name,
+        folder = ch.folder
+    );
+    p.push_str(&format!("Your display name is {}. Your routing handle remains @{}.\n", me.name(), me.handle));
+    if !me.briefing.trim().is_empty() {
+        p.push_str(&format!("\n## Your briefing\n{}\n", me.briefing.trim()));
+    }
+    // Only offer handoffs to agents that can actually work right now (on any engine).
+    let others: Vec<&Agent> = members.iter().filter(|a| a.id != me.id && shared.effective(a).is_some()).collect();
+    p.push_str("\n## Your team\n");
+    if others.is_empty() {
+        p.push_str("You are the only agent available in this channel right now, so do everything yourself.\n");
+    } else {
+        for a in &others {
+            let desc = if a.description.is_empty() { a.kind.label().to_string() } else { a.description.clone() };
+            let tag = if members.first().is_some_and(|m| m.id == a.id) { " (main agent)" } else { "" };
+            p.push_str(&format!("- {}{tag}: {}\n", a.label(), desc));
+        }
+        if is_main {
+            p.push_str(
+                "\nYou are the MAIN agent: the user talks to you and doesn't care which agent does the work. \
+                 Decide who should do it. ",
+            );
+        } else {
+            p.push_str(
+                "\nThe main agent coordinates and usually hands you tasks; focus on your role and report back \
+                 concisely. ",
+            );
+        }
+        p.push_str(&format!(
+            "To hand a task to a teammate, write a line that starts with \"@name:\" followed by a complete, \
+             self-contained brief, e.g.\n@{ex}: …\nThe app runs that agent and shows you its reply afterwards. \
+             Hand off when the task fits a teammate's role better than yours, or to work in parallel; otherwise \
+             just do it yourself. Never start a line with \"@name:\" unless you mean to hand off a task.\n",
+            ex = others[0].handle
+        ));
+    }
+    p.push_str(
+        "\n## House rules\nShared notes live in AGENTS.md (how to work in this project), TASKS.md (the task list: \
+         keep it up to date as you finish or discover work) and docs/. A heartbeat reports changes to these files \
+         in the channel every minute.\n\
+         Use your tools to actually do the work in the project folder. Reply in a concise chat style \
+         (Markdown is fine). The user mostly speaks instead of typing, so their messages are voice transcripts \
+         that may contain mistakes (e.g. \"docks\" for \"docs\"); interpret them sensibly and don't ask \
+         about obvious slips.\n",
+    );
+    p
+}
+
+/// Something an agent asked the app to do.
+#[derive(Debug, PartialEq, Clone)]
+pub enum AppAction {
+    NewChannel { name: String, folder: Option<String> },
+    Switch(String),
+    Send { channel: String, text: String },
+}
+
+/// Pull `/new-channel`, `/send` and `/switch` lines out of a reply. Returns the rest of the text and the actions.
+pub fn app_actions(reply: &str) -> (String, Vec<AppAction>) {
+    let mut kept = Vec::new();
+    let mut actions = Vec::new();
+    let mut in_code = false;
+    for line in reply.lines() {
+        let l = line.trim();
+        if l.starts_with("```") {
+            in_code = !in_code;
+            kept.push(line);
+            continue;
+        }
+        let cmd = l.trim_start_matches(['-', '*', '>', ' ']).trim_matches('`').trim();
+        let parsed = if in_code {
+            None
+        } else if let Some(rest) = cmd.strip_prefix("/new-channel ") {
+            // "<name, maybe with spaces> [~/path or /path]"
+            let rest = rest.trim();
+            let cut = [" ~/", " /", " \"~/", " \"/"].iter().filter_map(|p| rest.find(p)).min();
+            let (name, folder) = match cut {
+                Some(i) => (&rest[..i], Some(rest[i..].trim().trim_matches(['"', '\'', '`']).to_string())),
+                None => (rest, None),
+            };
+            let name = name.trim().trim_start_matches('#').to_string();
+            (!name.is_empty()).then_some(AppAction::NewChannel { name, folder: folder.filter(|f| !f.is_empty()) })
+        } else if let Some(rest) = cmd.strip_prefix("/send ") {
+            let mut parts = rest.trim().splitn(2, char::is_whitespace);
+            let channel = parts.next().unwrap_or("").trim_start_matches('#').to_string();
+            let text = parts.next().unwrap_or("").trim().to_string();
+            (!channel.is_empty() && !text.is_empty()).then_some(AppAction::Send { channel, text })
+        } else if let Some(rest) = cmd.strip_prefix("/switch ") {
+            let channel = rest.trim().trim_start_matches('#').to_string();
+            (!channel.is_empty()).then_some(AppAction::Switch(channel))
+        } else {
+            None
+        };
+        match parsed {
+            Some(a) => actions.push(a),
+            None => kept.push(line),
+        }
+    }
+    (kept.join("\n").trim().to_string(), actions)
+}
+
+/// Channel names are lowercase-with-dashes.
+pub fn channel_slug(s: &str) -> String {
+    let s: String = s.trim().trim_start_matches('#').to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '-' }).collect();
+    s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-")
+}
+
+/// Where a new channel's folder goes: what the agent said if it's inside your home folder,
+/// otherwise ~/Development/<name>.
+fn channel_folder(name: &str, folder: Option<&str>) -> String {
+    let home = model::home_dir();
+    let fallback = format!("{home}/Development/{name}");
+    let Some(f) = folder else { return fallback };
+    let f = if let Some(rest) = f.strip_prefix("~/") { format!("{home}/{rest}") } else { f.to_string() };
+    // Allowed: your home folder, or a temporary folder (macOS calls /tmp also /private/tmp).
+    let tmp = std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
+    let roots = [home.as_str(), tmp.as_str(), "/tmp", "/private/tmp", "/private/var/folders"];
+    if roots.iter().any(|r| f.starts_with(&format!("{r}/"))) && !f.contains("..") {
+        f.trim_end_matches('/').to_string()
+    } else {
+        fallback
+    }
+}
+
+fn run_app_actions(shared: &Arc<Shared>, from: &str, actions: &[AppAction]) {
+    for a in actions {
+        match a {
+            AppAction::NewChannel { name, folder } => {
+                let name = channel_slug(name);
+                if name.is_empty() {
+                    continue;
+                }
+                let folder = channel_folder(&name, folder.as_deref());
+                crate::inbox::handle(shared, &crate::inbox::new_channel(&name, &folder));
+                let shown = folder.replacen(&model::home_dir(), "~", 1);
+                shared.post(from, Author::System, format!("Opened #{name} ({shown})."), false);
+            }
+            AppAction::Switch(ch) => {
+                let id = shared.data.lock().unwrap().channels.iter().find(|c| c.name == channel_slug(ch)).map(|c| c.id.clone());
+                match id {
+                    Some(id) => {
+                        shared.data.lock().unwrap().selected = Some(id);
+                        shared.dirty.store(true, Ordering::Relaxed);
+                        (shared.repaint)();
+                    }
+                    None => shared.post(from, Author::System, format!("There's no channel called #{}.", channel_slug(ch)), true),
+                }
+            }
+            AppAction::Send { channel, text } => {
+                let name = channel_slug(channel);
+                let exists = shared.data.lock().unwrap().channels.iter().any(|c| c.name == name);
+                if !exists {
+                    shared.post(from, Author::System, format!("There's no channel called #{name}."), true);
+                    continue;
+                }
+                let origin = shared.data.lock().unwrap().channel(from).map(|c| c.name.clone()).unwrap_or_default();
+                crate::inbox::handle(shared, &crate::inbox::send(&name, &format!("(Passed on from #{origin}) {text}")));
+                shared.post(from, Author::System, format!("Handed over to #{name}."), false);
+            }
+        }
+    }
+}
+
+/// Who the user is addressing: `@handle` anywhere, or by voice a leading "Codex, …" / "Hey Claude …".
+/// `@all`, "everyone, …" = every member.
+pub fn user_mentions(text: &str, members: &[Agent]) -> Vec<String> {
+    let mut out = Vec::new();
+    for tok in mention_tokens(text) {
+        if tok == "all" || tok == "everyone" {
+            return members.iter().map(|a| a.id.clone()).collect();
+        }
+        if let Some(a) = members.iter().find(|a| a.answers_to(&tok)) {
+            if !out.contains(&a.id) {
+                out.push(a.id.clone());
+            }
+        }
+    }
+    if out.is_empty() {
+        out = spoken_address(text, members);
+    }
+    out
+}
+
+/// "Codex, run the tests" / "Hey Claude and Codex, …" / "Everyone: status?"
+fn spoken_address(text: &str, members: &[Agent]) -> Vec<String> {
+    let words: Vec<String> = text
+        .split(|c: char| c.is_whitespace())
+        .take(6)
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut i = 0;
+    while i < words.len() && ["hey", "hi", "ok", "okay", "so", "and", "yo", "hello"].contains(&words[i].as_str()) {
+        i += 1;
+    }
+    if i < words.len() && ["everyone", "everybody", "all", "team", "guys"].contains(&words[i].as_str()) {
+        return members.iter().map(|a| a.id.clone()).collect();
+    }
+    let mut out = Vec::new();
+    while i < words.len() {
+        match members.iter().find(|a| a.answers_to(&words[i])) {
+            Some(a) => {
+                if !out.contains(&a.id) {
+                    out.push(a.id.clone());
+                }
+                i += 1;
+                if i < words.len() && words[i] == "and" {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+fn mention_tokens(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@' && (i == 0 || !chars[i - 1].is_alphanumeric()) {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '-') {
+                j += 1;
+            }
+            if j > i + 1 {
+                out.push(chars[i + 1..j].iter().collect::<String>().trim_end_matches('-').to_lowercase());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Lines like `@codex: do X` (also `- **@codex:** do X`) in an agent reply.
+pub fn delegations(reply: &str, members: &[Agent], me: &str, exclude: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for line in reply.lines() {
+        let l = line.trim();
+        if l.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        let l = l.trim_start_matches(|c: char| c == '-' || c == '*' || c == '>' || c == '_' || c.is_whitespace());
+        let Some(rest) = l.strip_prefix('@') else { continue };
+        let handle: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+        let after = rest[handle.len()..].trim_start_matches(['*', '_']);
+        if !after.starts_with(':') || after[1..].trim().is_empty() {
+            continue;
+        }
+        if let Some(a) = members.iter().find(|a| a.answers_to(&handle)) {
+            if a.id != me && Some(a.id.as_str()) != exclude && !out.contains(&a.id) {
+                out.push(a.id.clone());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::AgentKind;
+
+    fn agent(id: &str, handle: &str, cmd: &str) -> Agent {
+        Agent {
+            id: id.into(),
+            handle: handle.into(),
+            display_name: String::new(),
+            kind: AgentKind::Custom,
+            model: String::new(),
+            full_access: false,
+            command: cmd.into(),
+            description: String::new(),
+            briefing: String::new(),
+            voice: String::new(),
+            effort: String::new(),
+            use_my_plugins: false,
+            color: [0, 0, 0],
+        }
+    }
+
+    fn channel(members: &[&str]) -> Channel {
+        Channel {
+            id: "c".into(),
+            name: "test".into(),
+            folder: std::env::temp_dir().to_string_lossy().into_owned(),
+            members: members.iter().map(|s| s.to_string()).collect(),
+            messages: vec![],
+            sessions: HashMap::new(),
+            seen: HashMap::new(),
+            watch: HashMap::new(),
+            unread: false,
+        }
+    }
+
+    fn wait(shared: &Arc<Shared>) -> Vec<(String, String)> {
+        let t = Instant::now();
+        while shared.runs.lock().unwrap().contains_key("c") {
+            assert!(t.elapsed().as_secs() < 20, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let data = shared.data.lock().unwrap();
+        data.channels[0].messages.iter().map(|m| (format!("{:?}", m.author), m.text.clone())).collect()
+    }
+
+    #[test]
+    fn finds_delegations() {
+        let m = vec![agent("a", "claude", ""), agent("b", "codex", "")];
+        let r = "Plan:\n- **@codex:** write tests\n@claude: me\n```\n@codex: not this\n```\nTalk to @codex later";
+        assert_eq!(delegations(r, &m, "a", None), vec!["b".to_string()]);
+        assert!(delegations("@codex: x", &m, "a", Some("b")).is_empty());
+        assert!(delegations("@codex:", &m, "a", None).is_empty());
+    }
+
+    #[test]
+    fn main_agent_answers_to_alex() {
+        let data = Data::default();
+        let main = data.agents[0].id.clone();
+        assert_eq!(data.agents[0].name(), "Alex");
+        for said in ["Alex, write a blog post", "Hey Alex, what's new?", "@alex status?", "@main status?", "OK alex and writer, go"] {
+            assert!(user_mentions(said, &data.agents).contains(&main), "{said}");
+        }
+        assert!(user_mentions("Alexander the Great", &data.agents).is_empty());
+        let writer = data.agents.iter().find(|a| a.handle == "writer").unwrap().id.clone();
+        assert_eq!(delegations("@Alex: please review", &data.agents, &writer, None), vec![main]);
+        assert_eq!(data.agents[0].label(), "Alex (@main)");
+    }
+
+    #[test]
+    fn finds_user_mentions() {
+        let m = vec![agent("a", "claude", ""), agent("b", "codex", "")];
+        assert_eq!(user_mentions("hey @Codex, look", &m), vec!["b".to_string()]);
+        assert_eq!(user_mentions("@all status?", &m).len(), 2);
+        assert!(user_mentions("mail me at x@codex.com", &m).is_empty());
+        // Spoken
+        assert_eq!(user_mentions("Codex, run the tests.", &m), vec!["b".to_string()]);
+        assert_eq!(user_mentions("Hey Claude and Codex, status?", &m), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(user_mentions("Everyone, what are you doing?", &m).len(), 2);
+        assert!(user_mentions("Run the tests and tell codex later", &m).is_empty());
+    }
+
+    /// Real processes: a lead that delegates to a helper, then wraps up.
+    #[test]
+    fn lead_delegates_then_wraps_up() {
+        let lead = agent(
+            "L",
+            "lead",
+            r#"input=$(cat); if printf '%s' "$input" | grep -q 'have replied above'; then echo "Final: helper says $(printf '%s' "$input" | grep -o 'ANSWER=[0-9]*' | tail -1)"; else echo "On it."; echo "@helper: compute 2+2"; fi"#,
+        );
+        let helper = agent("H", "helper", r#"cat >/dev/null; echo "ANSWER=4""#);
+        let data = Data { agents: vec![lead, helper], channels: vec![channel(&["L", "H"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "what is 2+2?".into());
+        let msgs = wait(&shared);
+        assert_eq!(msgs.len(), 4, "{msgs:#?}");
+        assert!(msgs[1].1.contains("@helper: compute 2+2"));
+        assert_eq!(msgs[2].1, "ANSWER=4");
+        assert_eq!(msgs[3].1, "Final: helper says ANSWER=4");
+        assert!(shared.activity.lock().unwrap()["c"].contains("helper"));
+    }
+
+    /// Two teammates briefed in one message work at the same time.
+    #[test]
+    fn handoffs_run_in_parallel() {
+        // Each helper marks that it started, waits, then checks whether the other one started too.
+        // Run one after another, neither would see the other; in parallel, both do.
+        let dir = std::env::temp_dir().join(format!("yh-par-{}", model::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.display();
+        let lead = agent(
+            "L",
+            "lead",
+            r#"input=$(cat); if printf '%s' "$input" | grep -q 'have replied above'; then echo "All done"; else echo "@one: task A"; echo "@two: task B"; fi"#,
+        );
+        let one = agent("1", "one", &format!(r#"cat >/dev/null; touch {d}/one; sleep 2; [ -f {d}/two ] && echo "A saw B" || echo "A alone""#));
+        let two = agent("2", "two", &format!(r#"cat >/dev/null; touch {d}/two; sleep 2; [ -f {d}/one ] && echo "B saw A" || echo "B alone""#));
+        let data = Data { agents: vec![lead, one, two], channels: vec![channel(&["L", "1", "2"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "do A and B".into());
+        let msgs = wait(&shared);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(msgs.iter().any(|(_, m)| m == "A saw B") && msgs.iter().any(|(_, m)| m == "B saw A"), "handoffs didn't overlap: {msgs:#?}");
+        assert_eq!(msgs.last().unwrap().1, "All done");
+    }
+
+    #[test]
+    fn parses_app_actions() {
+        let r = "Sure, setting that up.\n/new-channel Recipe Site ~/Development/recipes\n`/send recipe-site Build a recipe website`\n```\n/switch nope\n```";
+        let (text, actions) = app_actions(r);
+        assert_eq!(text, "Sure, setting that up.\n```\n/switch nope\n```");
+        assert_eq!(
+            actions,
+            vec![
+                AppAction::NewChannel { name: "Recipe Site".into(), folder: Some("~/Development/recipes".into()) },
+                AppAction::Send { channel: "recipe-site".into(), text: "Build a recipe website".into() },
+            ]
+        );
+        assert_eq!(channel_slug("My Site!"), "my-site");
+        let home = model::home_dir();
+        assert_eq!(channel_folder("x", None), format!("{home}/Development/x"));
+        assert_eq!(channel_folder("x", Some("~/Projects/x")), format!("{home}/Projects/x"));
+        assert_eq!(channel_folder("x", Some("/etc")), format!("{home}/Development/x"));
+        assert_eq!(channel_folder("x", Some("/private/tmp/a/x")), "/private/tmp/a/x");
+    }
+
+    /// The main agent creates a channel and hands the work over; the team there starts on it.
+    #[test]
+    fn main_agent_creates_channel_and_hands_over() {
+        let dir = std::env::temp_dir().join(format!("yh-newch-{}", model::new_id()));
+        let lead = agent(
+            "L",
+            "lead",
+            &format!(
+                r#"input=$(cat); if printf '%s' "$input" | grep -q 'Passed on from'; then echo "Starting on recipes"; else echo "Opening a channel for that."; echo "/new-channel recipes {}"; echo "/send recipes Build a recipe website"; fi"#,
+                dir.display()
+            ),
+        );
+        let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: Some("c".into()), settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "make a new channel for a recipe site".into());
+        let msgs = wait(&shared);
+        assert!(msgs.iter().any(|(_, t)| t == "Opening a channel for that."), "{msgs:#?}");
+        assert!(msgs.iter().any(|(_, t)| t.starts_with("Opened #recipes")), "{msgs:#?}");
+        assert!(!msgs.iter().any(|(_, t)| t.contains("/new-channel")));
+        // The new channel exists, is open, and its team got going.
+        let t = Instant::now();
+        loop {
+            let done = {
+                let data = shared.data.lock().unwrap();
+                let ch = data.channels.iter().find(|c| c.name == "recipes").expect("channel created");
+                assert_eq!(data.selected.as_deref(), Some(ch.id.as_str()));
+                ch.messages.iter().any(|m| m.text == "Starting on recipes")
+            };
+            if done {
+                break;
+            }
+            assert!(t.elapsed().as_secs() < 15, "team in the new channel never started");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Claude role whose engine is logged out runs on Codex instead, keeping its identity.
+    #[test]
+    fn role_falls_back_to_other_engine() {
+        let mut writer = agent("W", "writer", "");
+        writer.kind = AgentKind::Claude;
+        writer.briefing = "Write blog posts.".into();
+        let data = Data { agents: vec![writer.clone()], channels: vec![channel(&["W"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        let ok = Health { installed: true, logged_in: Some(true), ..Default::default() };
+        let out = Health { installed: true, logged_in: Some(false), ..Default::default() };
+        shared.health.lock().unwrap().insert("Claude Code".into(), out);
+        assert!(shared.effective(&writer).is_none(), "no known-good stand-in yet");
+        shared.health.lock().unwrap().insert("Codex".into(), ok);
+        let eff = shared.effective(&writer).unwrap();
+        assert_eq!(eff.kind, AgentKind::Codex);
+        assert_eq!(eff.handle, "writer");
+        assert_eq!(eff.briefing, "Write blog posts.");
+        assert_ne!(session_key(&writer), session_key(&eff));
+    }
+
+    /// The main agent is told it routes work; specialists get their briefing.
+    #[test]
+    fn prompts_carry_roles_and_briefings() {
+        let data = Data::default();
+        let shared = Shared::quiet(data.clone());
+        let ch = &data.channels[0];
+        let members = data.members(ch);
+        let main = preamble(ch, &members[0], &members, &shared);
+        assert!(main.contains("You are the MAIN agent"), "{main}");
+        assert!(main.contains("@writer: Blog post writer"), "{main}");
+        let writer = members.iter().find(|a| a.handle == "writer").unwrap();
+        let w = preamble(ch, writer, &members, &shared);
+        assert!(w.contains("## Your briefing") && w.contains("docs/blog/"), "{w}");
+        assert!(w.contains("Alex (@main) (main agent)"), "{w}");
+    }
+
+    /// "Everyone" with one agent out of quota: the other answers once, not twice.
+    #[test]
+    fn stand_in_answers_once() {
+        let lead = agent("L", "lead", r#"cat >/dev/null; echo "You've hit your usage limit" >&2; exit 1"#);
+        let backup = agent("B", "backup", r#"cat >/dev/null; echo "backup here""#);
+        let data = Data { agents: vec![lead, backup], channels: vec![channel(&["L", "B"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "Everyone, status?".into());
+        let msgs = wait(&shared);
+        assert_eq!(msgs.iter().filter(|(_, t)| t == "backup here").count(), 1, "{msgs:#?}");
+    }
+
+    /// The lead is out of quota: the other agent answers instead.
+    #[test]
+    fn fails_over_when_lead_hits_its_limit() {
+        let lead = agent("L", "lead", r#"cat >/dev/null; echo "You've hit your usage limit" >&2; exit 1"#);
+        let backup = agent("B", "backup", r#"cat >/dev/null; echo "backup here""#);
+        let data = Data { agents: vec![lead, backup], channels: vec![channel(&["L", "B"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "hello".into());
+        let msgs = wait(&shared);
+        assert!(msgs.iter().any(|(_, t)| t.contains("backup is taking over")), "{msgs:#?}");
+        assert_eq!(msgs.last().unwrap().1, "backup here");
+        // Next message skips the blocked lead straight away.
+        send(&shared, "c", "again".into());
+        let msgs = wait(&shared);
+        assert!(msgs.iter().any(|(_, t)| t.contains("lead is usage limit reached") || t.contains("so backup is taking this")), "{msgs:#?}");
+        assert_eq!(msgs.last().unwrap().1, "backup here");
+    }
+}
