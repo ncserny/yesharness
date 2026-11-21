@@ -1083,9 +1083,9 @@ pub fn app_actions(reply: &str) -> (String, Vec<AppAction>) {
         let parsed = if in_code {
             None
         } else if let Some(rest) = cmd.strip_prefix("/new-channel ") {
-            // "<name, maybe with spaces> [~/path or /path]"
+            // "<name, maybe with spaces> [~/path, /path or C:\path]"
             let rest = rest.trim();
-            let cut = [" ~/", " /", " \"~/", " \"/"].iter().filter_map(|p| rest.find(p)).min();
+            let cut = [" ~/", " /", " \"~/", " \"/"].iter().filter_map(|p| rest.find(p)).chain(windows_path_start(rest)).min();
             let (name, folder) = match cut {
                 Some(i) => (&rest[..i], Some(rest[i..].trim().trim_matches(['"', '\'', '`']).to_string())),
                 None => (rest, None),
@@ -1119,16 +1119,29 @@ pub fn channel_slug(s: &str) -> String {
 
 /// Where a new channel's folder goes: what the agent said if it's inside your home folder,
 /// otherwise ~/Development/<name>.
+/// Where a Windows path (" C:\…" or " C:/…", maybe quoted) starts in a /new-channel line.
+fn windows_path_start(rest: &str) -> Option<usize> {
+    let b = rest.as_bytes();
+    (0..b.len()).find(|&i| {
+        let j = if b.get(i + 1) == Some(&b'"') { i + 2 } else { i + 1 };
+        b[i] == b' ' && b.get(j).is_some_and(|c| c.is_ascii_alphabetic()) && b.get(j + 1) == Some(&b':') && matches!(b.get(j + 2), Some(b'\\' | b'/'))
+    })
+}
+
 fn channel_folder(name: &str, folder: Option<&str>) -> String {
+    use std::path::{Component, Path};
     let home = model::home_dir();
     let fallback = format!("{home}/Development/{name}");
     let Some(f) = folder else { return fallback };
     let f = if let Some(rest) = f.strip_prefix("~/") { format!("{home}/{rest}") } else { f.to_string() };
-    // Allowed: your home folder, or a temporary folder (macOS calls /tmp also /private/tmp).
-    let tmp = std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
-    let roots = [home.as_str(), tmp.as_str(), "/tmp", "/private/tmp", "/private/var/folders"];
-    if roots.iter().any(|r| f.starts_with(&format!("{r}/"))) && !f.contains("..") {
-        f.trim_end_matches('/').to_string()
+    // Allowed: inside your home folder, or a temporary folder (macOS calls /tmp also /private/tmp).
+    // Compared by path components, so Windows paths (C:\Users\…) work too.
+    let tmp = std::env::temp_dir();
+    let roots = [Path::new(&home), tmp.as_path(), Path::new("/tmp"), Path::new("/private/tmp"), Path::new("/private/var/folders")];
+    let p = Path::new(&f);
+    let inside = roots.iter().any(|r| p.starts_with(r) && p.components().count() > r.components().count());
+    if inside && !p.components().any(|c| c == Component::ParentDir) {
+        f.trim_end_matches(['/', '\\']).to_string()
     } else {
         fallback
     }
@@ -1633,6 +1646,16 @@ mod tests {
         assert_eq!(channel_folder("x", Some("~/Projects/x")), format!("{home}/Projects/x"));
         assert_eq!(channel_folder("x", Some("/etc")), format!("{home}/Development/x"));
         assert_eq!(channel_folder("x", Some("/private/tmp/a/x")), "/private/tmp/a/x");
+        let (_, a) = app_actions("/new-channel recipes C:\\Users\\me\\recipes\n/new-channel Two Words \"D:/work/site\"");
+        assert_eq!(
+            a,
+            vec![
+                AppAction::NewChannel { name: "recipes".into(), folder: Some("C:\\Users\\me\\recipes".into()) },
+                AppAction::NewChannel { name: "Two Words".into(), folder: Some("D:/work/site".into()) },
+            ]
+        );
+        assert_eq!(channel_folder("x", Some(&format!("{home}/../etc"))), format!("{home}/Development/x"));
+        assert_eq!(channel_folder("x", Some(&home)), format!("{home}/Development/x"), "not the home folder itself");
     }
 
     /// The main agent creates a channel and hands the work over; the team there starts on it.
