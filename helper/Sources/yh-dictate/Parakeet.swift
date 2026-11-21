@@ -108,7 +108,7 @@ final class Parakeet {
             heardSpeech = false
             generation += 1
             Task { [self] in
-                let text = await transcribe(audio)
+                let text = await inYourLanguage(await transcribe(audio), audio: audio)
                 q.async { if !text.isEmpty { out("U:" + text) } }
             }
             return
@@ -134,7 +134,7 @@ final class Parakeet {
         mic.stop()
         let audio = samples
         Task {
-            let text = await transcribe(audio)
+            let text = await inYourLanguage(await transcribe(audio), audio: audio)
             if filePath != nil {
                 FileHandle.standardError.write(String(format: "transcribed in %.2fs\n", Date().timeIntervalSince(started)).data(using: .utf8)!)
             }

@@ -44,7 +44,22 @@ pub struct Run {
     pub queue: VecDeque<String>,
     /// Messages being handled right now in this channel (they run side by side).
     pub active: usize,
+    /// Each running turn's own stop flag (Stop sets them all; a follow-up correction sets one).
+    pub turn_flags: Vec<Arc<AtomicBool>>,
 }
+
+/// The main agent answering one of your messages, so a quick follow-up ("I mean X") can restart it
+/// with both messages instead of a helper answering the follow-up on its own.
+pub struct LeadTurn {
+    pub agent: String,
+    /// Index of the user message it's answering.
+    pub user_msg: usize,
+    pub flag: Arc<AtomicBool>,
+    pub pid: Arc<Mutex<Option<u32>>>,
+}
+
+/// Seconds within which a second message counts as a follow-up to the first.
+const FOLLOW_UP_SECS: u64 = 45;
 
 type Hook<T> = Box<dyn Fn(T) + Send + Sync>;
 
@@ -71,6 +86,8 @@ pub struct Shared {
     pub engine_notes: Mutex<HashMap<String, AgentKind>>,
     /// "{channel}:{agent}" -> held while that agent runs a turn there (an agent never runs two turns at once).
     pub agent_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Channel id -> the main agent's turn on your latest message (see LeadTurn).
+    pub lead_turns: Mutex<HashMap<String, LeadTurn>>,
 }
 
 impl Shared {
@@ -91,6 +108,7 @@ impl Shared {
             notify,
             engine_notes: Mutex::new(HashMap::new()),
             agent_locks: Mutex::new(HashMap::new()),
+            lead_turns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -176,6 +194,7 @@ pub fn send(shared: &Arc<Shared>, cid: &str, text: String) {
 
 /// Send with images attached (absolute paths inside the project folder).
 pub fn send_with(shared: &Arc<Shared>, cid: &str, text: String, attachments: Vec<String>) {
+    restart_for_follow_up(shared, cid);
     if let Some(ch) = shared.data.lock().unwrap().channel_mut(cid) {
         ch.messages.push(Message { author: Author::User, text: text.clone(), ts: model::now(), error: false, to_user: false, via: String::new(), attachments, receipt: String::new(), idle_claim: false });
     }
@@ -209,6 +228,7 @@ pub fn send_with(shared: &Arc<Shared>, cid: &str, text: String, attachments: Vec
                         started: Instant::now(),
                         queue: VecDeque::new(),
                         active: 1,
+                        turn_flags: Vec::new(),
                     },
                 );
             }
@@ -217,6 +237,38 @@ pub fn send_with(shared: &Arc<Shared>, cid: &str, text: String, attachments: Vec
     let shared = shared.clone();
     let cid = cid.to_string();
     std::thread::spawn(move || run_handler(&shared, &cid, &text));
+}
+
+/// You sent another message right after one the main agent is still answering (a correction, a missing
+/// detail): stop that answer, so the agent answers both together. Otherwise a helper would answer the
+/// follow-up on its own, without the first message, and you'd get two half-answers.
+fn restart_for_follow_up(shared: &Arc<Shared>, cid: &str) {
+    let (prev, prev_ts, answered) = {
+        let data = shared.data.lock().unwrap();
+        let Some(ch) = data.channel(cid) else { return };
+        let Some(i) = ch.messages.iter().rposition(|m| m.author == Author::User) else { return };
+        let answered = ch.messages[i + 1..].iter().any(|m| matches!(m.author, Author::Agent(_)));
+        (i, ch.messages[i].ts, answered)
+    };
+    if answered || model::now().saturating_sub(prev_ts) > FOLLOW_UP_SECS {
+        return;
+    }
+    let target = {
+        let turns = shared.lead_turns.lock().unwrap();
+        match turns.get(cid) {
+            Some(t) if t.user_msg == prev && !t.flag.load(Ordering::Relaxed) => {
+                t.flag.store(true, Ordering::Relaxed);
+                Some((t.agent.clone(), *t.pid.lock().unwrap()))
+            }
+            _ => None,
+        }
+    };
+    let Some((agent, pid)) = target else { return };
+    if let Some(pid) = pid {
+        env::kill_tree(pid);
+    }
+    let name = shared.data.lock().unwrap().agent(&agent).map(|a| a.name().to_string()).unwrap_or_else(|| "The main agent".into());
+    shared.post(cid, Author::System, format!("{name} is starting over with both of your messages."), false);
 }
 
 /// Register a handler on the channel's run and start it.
@@ -235,6 +287,7 @@ fn start_handler(shared: &Arc<Shared>, cid: &str, text: String) {
                         started: Instant::now(),
                         queue: VecDeque::new(),
                         active: 1,
+                        turn_flags: Vec::new(),
                     },
                 );
             }
@@ -262,6 +315,7 @@ pub fn stop(shared: &Arc<Shared>, cid: &str) {
         let mut runs = shared.runs.lock().unwrap();
         let Some(r) = runs.get_mut(cid) else { return };
         r.cancel.store(true, Ordering::Relaxed);
+        r.turn_flags.iter().for_each(|f| f.store(true, Ordering::Relaxed));
         r.queue.clear();
         for w in r.working.iter_mut() {
             w.1 = "stopping…".into();
@@ -509,8 +563,10 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
     let guard = match lock.try_lock() {
         Ok(g) => g,
         Err(_) => {
+            // It's stopping its answer to your previous message to take both together: wait for it.
+            let restarting = shared.lead_turns.lock().unwrap().get(cid).is_some_and(|t| t.agent == agent.id && t.flag.load(Ordering::Relaxed));
             // Busy: rather than make you wait, a General helper takes it.
-            if matches!(mode, Mode::User | Mode::Delegated { .. }) {
+            if matches!(mode, Mode::User | Mode::Delegated { .. }) && !restarting {
                 if let Some((gid, ginst)) = free_general(shared, cid, (agent.id.as_str(), inst)) {
                     let gname = shared.data.lock().unwrap().agent(&gid).map(|a| a.name().to_string()).unwrap_or_else(|| "General".into());
                     let label = if ginst == 0 { gname } else { format!("{gname} #{}", ginst + 1) };
@@ -542,12 +598,22 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
     }
     // Our own process slot, so parallel turns can each be stopped.
     let pid = Arc::new(Mutex::new(None));
-    let cancel = {
-        let runs = shared.runs.lock().unwrap();
-        let Some(r) = runs.get(cid) else { return };
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut runs = shared.runs.lock().unwrap();
+        let Some(r) = runs.get_mut(cid) else { return };
         r.pids.lock().unwrap().push(pid.clone());
-        r.cancel.clone()
-    };
+        if r.cancel.load(Ordering::Relaxed) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        r.turn_flags.push(cancel.clone());
+    }
+    // The main agent answering you: a quick follow-up message can restart this turn (restart_for_follow_up).
+    let _lead = (matches!(mode, Mode::User) && inst == 0 && depth == 0 && members.first().is_some_and(|m| m.id == agent.id)).then(|| {
+        let user_msg = shared.data.lock().unwrap().channel(cid).and_then(|c| c.messages.iter().rposition(|m| m.author == Author::User)).unwrap_or(0);
+        shared.lead_turns.lock().unwrap().insert(cid.to_string(), LeadTurn { agent: agent.id.clone(), user_msg, flag: cancel.clone(), pid: pid.clone() });
+        LeadTurnGuard { shared, cid, flag: cancel.clone() }
+    });
     let status = |s: String| shared.set_status(cid, &agent.handle, s);
     let ctl = Ctl { cancel: &cancel, pid: &pid, status: &status };
     // Long-term memory: the channel's note (new conversations) and older messages related to this request.
@@ -655,8 +721,9 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
     }
     out.receipt.tokens += router_tokens;
     shared.done_working(cid, &agent.handle);
-    if let Some(r) = shared.runs.lock().unwrap().get(cid) {
+    if let Some(r) = shared.runs.lock().unwrap().get_mut(cid) {
         r.pids.lock().unwrap().retain(|p| !Arc::ptr_eq(p, &pid));
+        r.turn_flags.retain(|f| !Arc::ptr_eq(f, &cancel));
     }
     if cancel.load(Ordering::Relaxed) {
         return;
@@ -697,7 +764,15 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         t.tokens > TOKEN_BUDGET
     };
     // An agent that tried something and was blocked isn't making empty promises: it already says why.
-    let idle_claim = !out.error && !out.receipt.did_work() && out.receipt.blocked == 0 && delegates.is_empty() && actions.is_empty() && claims_work(&shown, &members);
+    // Nor is one that looked things up and answered, or that asks you for something ("send me the link and I'll…").
+    let idle_claim = !out.error
+        && !out.receipt.did_work()
+        && out.receipt.blocked == 0
+        && out.receipt.lookups == 0
+        && delegates.is_empty()
+        && actions.is_empty()
+        && !asks_user(&shown)
+        && claims_work(&shown, &members);
 
     let to_user = matches!(mode, Mode::User | Mode::FollowUp | Mode::Nudge) && !out.error;
     if matches!(mode, Mode::User) && !out.error {
@@ -821,6 +896,10 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
         let seen = ch.seen.get(&me.id).copied().unwrap_or(0).min(ch.messages.len());
         start = seen.max(ch.messages.len().saturating_sub(HISTORY));
         p.push_str(&format!("## New messages in #{} since your last turn\n\n", ch.name));
+        p.push_str(&format!(
+            "(You can read the user's other projects in {}. If they name one you can't place, look there and ask.)\n\n",
+            model::projects_dir().replacen(&model::home_dir(), "~", 1)
+        ));
     } else {
         p.push_str(&preamble(ch, me, members, shared));
         start = ch.messages.len().saturating_sub(HISTORY);
@@ -859,7 +938,9 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
     let name = |id: &str| data.agent(id).map(|a| a.handle.clone()).unwrap_or_else(|| "agent".into());
     p.push_str("## Your turn\n");
     p.push_str(&match mode {
-        Mode::User => "Respond to the user's latest message above.".to_string(),
+        Mode::User => "Respond to the user's latest message above. If their last few messages belong together (a \
+                       correction like \"I mean X\", or a detail added right after), answer them as one request."
+            .to_string(),
         Mode::Delegated { from } => format!(
             "@{from} handed you a task: the line starting with \"@{me}:\" above (or, if you're standing in for a busy \
              teammate, the latest \"@name:\" line from @{from}), plus anything said since. Do it, then reply with a short \
@@ -903,6 +984,22 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
     p
 }
 
+/// Unregisters a LeadTurn when the turn ends (unless a newer turn replaced it).
+struct LeadTurnGuard<'a> {
+    shared: &'a Shared,
+    cid: &'a str,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for LeadTurnGuard<'_> {
+    fn drop(&mut self) {
+        let mut t = self.shared.lead_turns.lock().unwrap();
+        if t.get(self.cid).is_some_and(|l| Arc::ptr_eq(&l.flag, &self.flag)) {
+            t.remove(self.cid);
+        }
+    }
+}
+
 /// Older messages related to the latest request, for a full prompt (beyond its HISTORY window) and a router
 /// prompt (beyond its last 12 messages). Empty when memory is off or not set up.
 fn memory_recall(shared: &Shared, cid: &str) -> (String, String) {
@@ -929,9 +1026,13 @@ fn memory_recall(shared: &Shared, cid: &str) -> (String, String) {
 /// Adds the memory note (at the start of a conversation) and recalled messages, just before "## Your turn".
 fn with_memory(mut prompt: String, cid: &str, fresh: bool, recall: &str, shared: &Shared) -> String {
     if !shared.data.lock().unwrap().settings.memory {
+        // What you told the app about yourself is used even with memory off.
+        if fresh {
+            insert_memory(&mut prompt, &crate::memory::you_section());
+        }
         return prompt;
     }
-    let mut extra = if fresh { crate::memory::note_section(cid) } else { String::new() };
+    let mut extra = if fresh { format!("{}{}", crate::memory::you_section(), crate::memory::note_section(cid)) } else { String::new() };
     extra.push_str(recall);
     insert_memory(&mut prompt, &extra);
     prompt
@@ -971,6 +1072,11 @@ fn build_router_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data,
         p.push_str(&format!("- {}: {}\n", a.label(), desc));
     }
     p.push_str(&facts(ch, me, data, shared));
+    p.push_str(&format!(
+        "\nThe user speaks; names in transcripts get mangled. Their projects are folders in {}: if they name one you \
+         can't place, reply /work to look, or ask which one they mean. Never guess a different project.\n",
+        model::projects_dir().replacen(&model::home_dir(), "~", 1)
+    ));
     p.push_str("\n## Recent conversation\n");
     let start = ch.messages.len().saturating_sub(ROUTER_HISTORY);
     for m in &ch.messages[start..] {
@@ -1048,15 +1154,18 @@ fn preamble(ch: &Channel, me: &Agent, members: &[Agent], shared: &Shared) -> Str
             ex = others[0].handle
         ));
     }
-    p.push_str(
+    p.push_str(&format!(
         "\n## House rules\nShared notes live in AGENTS.md (how to work in this project), TASKS.md (the task list: \
          keep it up to date as you finish or discover work) and docs/. A heartbeat reports changes to these files \
          in the channel every minute.\n\
          Use your tools to actually do the work in the project folder. Reply in a concise chat style \
          (Markdown is fine). The user mostly speaks instead of typing, so their messages are voice transcripts \
          that may contain mistakes (e.g. \"docks\" for \"docs\"); interpret them sensibly and don't ask \
-         about obvious slips.\n",
-    );
+         about obvious slips. Names get mangled most (\"Moon pace\" for \"Moonbase\"): when the user names a \
+         project, look for it (their projects are folders in {projects}, which you can read; also their GitHub) \
+         and if nothing clearly matches, say what you found and ask which one they mean instead of guessing.\n",
+        projects = model::projects_dir().replacen(&model::home_dir(), "~", 1)
+    ));
     p
 }
 
@@ -1279,6 +1388,16 @@ pub fn claims_work(text: &str, members: &[Agent]) -> bool {
     members.iter().any(|m| t.contains(&format!("@{}", m.handle.to_lowercase())))
 }
 
+/// The reply asks you for something (a question, a link, a choice): it's waiting on you, not promising work.
+pub fn asks_user(text: &str) -> bool {
+    let t = text.to_lowercase().replace('’', "'");
+    const ASKS: [&str; 12] = [
+        "send me", "tell me", "give me", "let me know", "could you", "can you", "would you", "which one", "do you want",
+        "should i", "please share", "please send",
+    ];
+    t.contains('?') || ASKS.iter().any(|a| t.contains(a))
+}
+
 /// What really happened recently in this channel, for the main agent's prompt.
 fn facts(ch: &Channel, me: &Agent, data: &Data, shared: &Shared) -> String {
     let working: Vec<String> = shared
@@ -1463,6 +1582,9 @@ mod tests {
         // Facts about the world aren't promises (the reply from the Turin screenshot).
         assert!(!claims_work("In past years the two semis have started around early afternoon, Turin time.", &m));
         assert!(claims_work("The developer is working on it now.", &m));
+        // Waiting on the user, not an empty promise (a real reply).
+        assert!(asks_user("Send me a link, or give the agents access to its folder, and I'll review it."));
+        assert!(!asks_user("On it, I'll start right away."));
         assert!(!claims_work("Sure, let me know which file.", &m));
     }
 
@@ -1515,12 +1637,31 @@ mod tests {
 
     /// The lead is still busy when you send something else: a General helper takes it instead of making you wait.
     #[test]
+    fn follow_up_restarts_the_lead_with_both_messages() {
+        // "Look up Moon pace" … "Moonbase." The lead starts over and answers both together; no helper answers
+        // the correction on its own.
+        let lead = agent("L", "main", &fake(&[("Moonbase.", "Found Moonbase"), ("", "sleep=4;answered the first only")]));
+        let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "Can you look up Moon pace, my project?".into());
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        send(&shared, "c", "Moonbase.".into());
+        let msgs = wait(&shared);
+        assert!(msgs.iter().any(|(_, m)| m.contains("starting over with both")), "{msgs:#?}");
+        assert!(msgs.iter().any(|(_, m)| m == "Found Moonbase"), "{msgs:#?}");
+        assert!(!msgs.iter().any(|(_, m)| m.contains("first only") || m.contains("General")), "{msgs:#?}");
+        assert!(!msgs.iter().any(|(_, m)| m.contains("(stopped)")), "the stopped turn stays silent: {msgs:#?}");
+    }
+
+    #[test]
     fn general_helper_steps_in_when_busy() {
         let lead = agent("L", "main", &fake(&[("Your role: General", "second done"), ("", "sleep=2;first done")]));
         let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "first, a slow one".into());
         std::thread::sleep(std::time::Duration::from_millis(500));
+        // A separate request, a while later (a quick follow-up would restart the lead instead).
+        shared.data.lock().unwrap().channels[0].messages.iter_mut().filter(|m| m.author == Author::User).for_each(|m| m.ts -= 120);
         send(&shared, "c", "second, quick".into());
         let msgs = wait(&shared);
         let pos = |t: &str| msgs.iter().position(|(_, m)| m == t).unwrap_or_else(|| panic!("missing {t}: {msgs:#?}"));

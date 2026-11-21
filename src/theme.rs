@@ -126,6 +126,15 @@ fn fonts() -> FontDefinitions {
         f.font_data.insert("sf".into(), Arc::new(FontData::from_owned(sf)));
         f.families.entry(FontFamily::Proportional).or_default().insert(0, "sf".into());
     }
+    // A warm serif for the welcome screen (New York, then Georgia); falls back to the UI font.
+    let serif = load("/System/Library/Fonts/NewYork.ttf").or_else(|| load("/System/Library/Fonts/Supplemental/Georgia.ttf"));
+    let mut serif_family = Vec::new();
+    if let Some(ny) = serif {
+        f.font_data.insert("serif".into(), Arc::new(FontData::from_owned(ny)));
+        serif_family.push("serif".to_string());
+    }
+    serif_family.extend(f.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+    f.families.insert(FontFamily::Name("serif".into()), serif_family);
     if let Some(mono) = load("/System/Library/Fonts/SFNSMono.ttf") {
         f.font_data.insert("sfmono".into(), Arc::new(FontData::from_owned(mono)));
         f.families.entry(FontFamily::Monospace).or_default().insert(0, "sfmono".into());

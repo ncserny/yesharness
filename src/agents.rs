@@ -131,9 +131,15 @@ fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>,
         // Lean: no global MCP servers to start and describe on every turn.
         cmd.arg("--strict-mcp-config");
     }
-    // Internet (on by default): web search and page fetches don't need "Full access".
-    if agent.internet && !agent.full_access {
-        cmd.arg("--allowedTools=WebSearch,WebFetch");
+    if !agent.full_access {
+        // Read-only access to your other projects (so "look at my project X" works); edits stay in this folder.
+        let projects = crate::model::projects_dir();
+        let mut allowed = vec![format!("Read(/{projects}/**)"), format!("Glob(/{projects}/**)"), format!("Grep(/{projects}/**)"), "Bash(ls:*)".to_string()];
+        // Internet (on by default): web search and page fetches don't need "Full access".
+        if agent.internet {
+            allowed.extend(["WebSearch".to_string(), "WebFetch".to_string()]);
+        }
+        cmd.arg(format!("--allowedTools={}", allowed.join(",")));
     }
     // Step limit (each step re-sends the conversation).
     cmd.args(["--max-turns", &agent.step_cap().to_string()]);
@@ -500,6 +506,9 @@ fn run_custom(agent: &Agent, folder: &Path, prompt: &str, ctl: &Ctl) -> Outcome 
 
 /// Spawns `cmd`, feeds stdin, calls `on_line` for each stdout line. Returns (success, stderr).
 fn stream(mut cmd: Command, stdin: Option<String>, ctl: &Ctl, mut on_line: impl FnMut(&str)) -> Result<(bool, String), String> {
+    if ctl.cancel.load(Ordering::Relaxed) {
+        return Err("(stopped)".into());
+    }
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

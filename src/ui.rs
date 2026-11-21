@@ -53,6 +53,9 @@ pub struct App {
     /// ElevenLabs API key being typed in Settings (moved to the Keychain on Save, then cleared).
     eleven_key: String,
     eleven_note: Option<String>,
+    about: Option<AboutYou>,
+    /// The first-run welcome (Alex asks a few questions out loud).
+    welcome: Option<crate::welcome::Welcome>,
     /// Slide-out on the right: a file (TASKS.md, AGENTS.md) or the docs folder.
     panel: Option<Panel>,
     last_save: Instant,
@@ -108,6 +111,50 @@ fn join_words(base: &str, add: &str) -> String {
         (_, true) => base.to_string(),
         _ => format!("{} {add}", base.trim_end()),
     }
+}
+
+/// Languages offered in the first-run questions (code, name).
+const LANGUAGES: [(&str, &str); 10] = [
+    ("en", "English"), ("de", "German"), ("fr", "French"), ("es", "Spanish"), ("it", "Italian"),
+    ("nl", "Dutch"), ("pt", "Portuguese"), ("pl", "Polish"), ("sv", "Swedish"), ("tr", "Turkish"),
+];
+
+/// The first-run questions ("About you"), or the note itself when you edit it later.
+struct AboutYou {
+    name: String,
+    work: String,
+    projects: String,
+    langs: Vec<String>,
+    short: bool,
+    /// Editing the saved note as text (Settings → About you).
+    raw: Option<String>,
+}
+
+impl AboutYou {
+    fn new(langs: &[String]) -> Self {
+        // Your macOS account name and the projects you touched lately, as a head start.
+        let name = std::process::Command::new("id").arg("-F").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let dir = model::projects_dir();
+        let short_dir = dir.replacen(&model::home_dir(), "~", 1);
+        let projects = crate::memory::recent_projects(std::path::Path::new(&dir), 6)
+            .into_iter()
+            .map(|p| format!("- {p} — {short_dir}/{p} — what it is: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let langs = if langs.is_empty() { system_languages() } else { langs.to_vec() };
+        AboutYou { name, work: String::new(), projects, langs, short: true, raw: None }
+    }
+}
+
+/// Your Mac's languages (System Settings → Language & Region), as codes we offer.
+fn system_languages() -> Vec<String> {
+    let out = std::process::Command::new("defaults").args(["read", "-g", "AppleLanguages"]).output().ok();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase()).unwrap_or_default();
+    let mut v: Vec<String> = LANGUAGES.iter().filter(|(c, _)| text.contains(&format!("\"{c}")) || text.contains(&format!(" {c}-")) || text.contains(&format!("\n    {c},"))).map(|(c, _)| c.to_string()).collect();
+    if v.is_empty() {
+        v.push("en".into());
+    }
+    v
 }
 
 struct NewChannel {
@@ -187,6 +234,8 @@ impl App {
             renaming: None,
             eleven_key: String::new(),
             eleven_note: None,
+            about: None,
+            welcome: None,
             panel: None,
             last_save: Instant::now(),
             focus_input: false,
@@ -225,7 +274,8 @@ impl App {
         let c = ctx.clone();
         let engine = self.engine();
         let barge_in = self.shared.data.lock().unwrap().settings.barge_in;
-        match Dictation::start(mode, &self.vocabulary(), &engine, barge_in, move || c.request_repaint()) {
+        let langs = self.shared.data.lock().unwrap().settings.languages.join(",");
+        match Dictation::start(mode, &self.vocabulary(), &engine, barge_in, &langs, move || c.request_repaint()) {
             Ok(d) => {
                 self.dictation = Some(d);
                 self.voice_engine = self.listen_key();
@@ -234,9 +284,81 @@ impl App {
         }
     }
 
+    fn new_welcome(&self) -> crate::welcome::Welcome {
+        let langs = self.shared.data.lock().unwrap().settings.languages.clone();
+        let langs = if langs.is_empty() { system_languages() } else { langs };
+        let name = std::process::Command::new("id").arg("-F").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        crate::welcome::Welcome::new(name, langs, &model::projects_dir())
+    }
+
+    /// The welcome screen, instead of the normal window, until it's done. Returns true while it shows.
+    fn welcome_ui(&mut self, ctx: &egui::Context) -> bool {
+        let first_run = {
+            let d = self.shared.data.lock().unwrap();
+            !d.settings.onboarded && (std::env::var_os("YH_SCREENSHOT").is_none() || std::env::var_os("YH_SHOW_ONBOARDING").is_some())
+        };
+        if self.welcome.is_none() && first_run {
+            self.welcome = Some(self.new_welcome());
+        }
+        if self.welcome.is_none() {
+            return false;
+        }
+        // Listen for answers even if you normally use push-to-talk.
+        if self.dictation.is_none() && self.voice_error.is_none() {
+            self.start_voice(Mode::HandsFree, ctx);
+        }
+        let answers = self.poll_voice(ctx);
+        let (live, level) = self.dictation.as_ref().map(|d| {
+            let s = d.state.lock().unwrap();
+            (s.text.clone(), s.level)
+        }).unwrap_or_default();
+        let (alex_color, alex_voice) = {
+            let d = self.shared.data.lock().unwrap();
+            let idx = d.agents.iter().position(|a| a.handle == "main").unwrap_or(0);
+            d.agents.get(idx).map(|a| (color(a.color), voice::agent_voice(idx, &a.voice, &a.eleven_voice))).unwrap_or((Color32::from_rgb(232, 104, 74), String::new()))
+        };
+        let w = self.welcome.as_mut().unwrap();
+        for a in answers {
+            w.hear(&a);
+        }
+        if let Some(q) = w.take_question_to_speak() {
+            if std::env::var_os("YH_SCREENSHOT").is_none() {
+                voice::stop_speaking();
+                voice::speak(&q, &alex_voice);
+            }
+        }
+        let outcome = w.show(ctx, &live, level, voice::speaking(), alex_color);
+        let finished = !matches!(outcome, crate::welcome::Outcome::Continue);
+        let mut data = self.shared.data.lock().unwrap();
+        match outcome {
+            crate::welcome::Outcome::Finished(note, langs) => {
+                let _ = crate::memory::write_you(&note);
+                data.settings.languages = langs;
+                data.settings.onboarded = true;
+            }
+            crate::welcome::Outcome::Skipped => data.settings.onboarded = true,
+            crate::welcome::Outcome::Continue => {}
+        }
+        let hands_free = data.settings.hands_free;
+        drop(data);
+        if finished {
+            self.welcome = None;
+            voice::stop_speaking();
+            self.shared.dirty.store(true, Ordering::Relaxed);
+            if !hands_free {
+                self.dictation = None; // back to push-to-talk
+            }
+            let _ = model::save(&self.shared.data.lock().unwrap());
+        }
+        true
+    }
+
     /// What always-listening was started with; a change restarts it.
     fn listen_key(&self) -> String {
-        format!("{}:{}", self.engine(), self.shared.data.lock().unwrap().settings.barge_in)
+        let d = self.shared.data.lock().unwrap();
+        let (barge_in, langs) = (d.settings.barge_in, d.settings.languages.join(","));
+        drop(d);
+        format!("{}:{barge_in}:{langs}", self.engine())
     }
 
     /// The engine to use right now: Parakeet once it's set up, otherwise Apple's.
@@ -452,6 +574,9 @@ impl eframe::App for App {
             p.rect(card, 16.0, t.bg, Stroke::new(2.0_f32, t.accent), egui::StrokeKind::Inside);
             p.text(card.center() - vec2(0.0, 12.0), Align2::CENTER_CENTER, "Drop to attach", FontId::proportional(17.0), t.strong);
             p.text(card.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, "Goes with your next message", FontId::proportional(12.5), t.secondary);
+        }
+        if self.welcome_ui(ctx) {
+            return;
         }
         let to_send = self.poll_voice(ctx);
         let voice_state = self.dictation.as_ref().map(|d| (d.mode, d.stopping(), d.state.lock().unwrap().clone()));
@@ -1789,6 +1914,7 @@ impl App {
         if self.show_settings {
             let mut done = false;
             let mut toggle_listening = false;
+            let mut open_about: Option<Option<String>> = None;
             let eleven_key = &mut self.eleven_key;
             let eleven_note = &mut self.eleven_note;
             let resp = egui::Modal::new(Id::new("settings")).frame(sheet_frame).backdrop_color(backdrop).show(ctx, |ui| {
@@ -1814,6 +1940,17 @@ impl App {
                             }
                         });
                         ui.label(RichText::new("Automatic follows your Mac's light or dark appearance.").size(11.5).color(t.secondary));
+                    });
+                    group(ui, t, "You", |ui| {
+                        form_row(ui, t, "About you", |ui| {
+                            let saved = crate::memory::read_you();
+                            ui.label(RichText::new(if saved.is_some() { "What every agent knows about you and your projects" } else { "Not filled in yet" }).size(12.0).color(t.secondary));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(if saved.is_some() { "Edit…" } else { "Fill In…" }).clicked() {
+                                    open_about = Some(saved);
+                                }
+                            });
+                        });
                     });
                     group(ui, t, "Agents", |ui| {
                         form_row(ui, t, "Quick routing", |ui| {
@@ -1984,9 +2121,119 @@ impl App {
             if toggle_listening {
                 self.toggle_hands_free(ctx);
             }
+            if let Some(saved) = open_about {
+                // Edit the note as text once it exists; otherwise Alex asks the questions again.
+                let langs = shared.data.lock().unwrap().settings.languages.clone();
+                match saved {
+                    Some(text) => {
+                        let mut a = AboutYou::new(&langs);
+                        a.raw = Some(text);
+                        self.about = Some(a);
+                    }
+                    None => self.welcome = Some(self.new_welcome()),
+                }
+                done = true;
+            }
             if done || resp.should_close() {
                 self.show_settings = false;
                 voice::refresh_voices(); // maybe you downloaded some meanwhile
+            }
+        }
+
+        // ------------------------------------------------ about you (first run, or Settings → About you)
+        let first_run = {
+            let d = shared.data.lock().unwrap();
+            !d.settings.onboarded && (std::env::var_os("YH_SCREENSHOT").is_none() || std::env::var_os("YH_SHOW_ONBOARDING").is_some())
+        };
+        let _ = first_run; // the welcome screen handles the first run (see update)
+        if self.about.is_some() {
+            let mut save = false;
+            let mut skip = false;
+            egui::Modal::new(Id::new("about-you")).frame(sheet_frame).backdrop_color(backdrop).show(ctx, |ui| {
+                let Some(a) = self.about.as_mut() else { return };
+                ui.set_width(520.0);
+                Frame::new().inner_margin(Margin::same(20)).show(ui, |ui| {
+                    ui.label(RichText::new(if a.raw.is_some() { "About You" } else { "Welcome to YesHarness" }).size(16.0).color(t.strong));
+                    let sub = if a.raw.is_some() {
+                        "Every agent reads this. Add projects, preferences, anything they should know."
+                    } else {
+                        "A few questions so your agents know who you are and what you work on. You can change this any time in Settings."
+                    };
+                    ui.add(egui::Label::new(RichText::new(sub).size(12.0).color(t.secondary)).wrap());
+                    ui.add_space(12.0);
+                    if let Some(raw) = a.raw.as_mut() {
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            ui.add(egui::TextEdit::multiline(raw).desired_width(f32::INFINITY).desired_rows(14));
+                        });
+                    } else {
+                        group(ui, t, "", |ui| {
+                            form_row(ui, t, "Your name", |ui| {
+                                ui.add(egui::TextEdit::singleline(&mut a.name).hint_text("What should the agents call you?").desired_width(f32::INFINITY));
+                            });
+                            form_sep(ui, t);
+                            form_row(ui, t, "What you do", |ui| {
+                                ui.add(egui::TextEdit::singleline(&mut a.work).hint_text("e.g. founder, I build web apps").desired_width(f32::INFINITY));
+                            });
+                            form_sep(ui, t);
+                            form_row(ui, t, "Languages", |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (code, label) in LANGUAGES {
+                                        let mut on = a.langs.iter().any(|l| l == code);
+                                        if ui.checkbox(&mut on, label).changed() {
+                                            if on {
+                                                a.langs.push(code.to_string());
+                                            } else {
+                                                a.langs.retain(|l| l != code);
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                            form_sep(ui, t);
+                            form_row(ui, t, "Answers", |ui| {
+                                if let Some(i) = segmented(ui, t, if a.short { 0 } else { 1 }, &["Short and direct", "Detailed"]) {
+                                    a.short = i == 0;
+                                }
+                            });
+                        });
+                        group(ui, t, "Your projects", |ui| {
+                            ui.add(egui::Label::new(RichText::new("One per line: name — folder or link — what it is. These are the ones you touched lately; edit, add or remove.").size(11.5).color(t.secondary)).wrap());
+                            ui.add(egui::TextEdit::multiline(&mut a.projects).hint_text("- Moonbase — moonbase.example — art gallery website").desired_width(f32::INFINITY).desired_rows(6));
+                        });
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if primary_button(ui, t, "Save", true) {
+                                save = true;
+                            }
+                            if ui.button(if a.raw.is_some() { "Cancel" } else { "Skip for Now" }).clicked() {
+                                skip = true;
+                            }
+                        });
+                    });
+                });
+            });
+            if save || skip {
+                let a = self.about.take().unwrap();
+                let mut data = shared.data.lock().unwrap();
+                data.settings.onboarded = true;
+                if save {
+                    let text = match &a.raw {
+                        Some(raw) => raw.clone(),
+                        None => {
+                            // Drop the "what it is:" placeholder where you didn't fill it in.
+                            let projects: String = a.projects.lines().map(|l| l.trim_end().trim_end_matches("— what it is:").trim_end()).collect::<Vec<_>>().join("\n");
+                            let names: Vec<&str> = LANGUAGES.iter().filter(|(c, _)| a.langs.iter().any(|l| l == c)).map(|(_, n)| *n).collect();
+                            data.settings.languages = a.langs.clone();
+                            let answers = if a.short { "Short and direct: one or two sentences unless I ask for more" } else { "Detailed, with explanations" };
+                            crate::memory::you_note(&a.name, &a.work, &projects, &names, answers)
+                        }
+                    };
+                    let _ = crate::memory::write_you(&text);
+                }
+                drop(data);
+                self.shared.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
 

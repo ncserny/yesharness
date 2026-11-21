@@ -478,6 +478,74 @@ fn top(index: &Index, q: &[f32], before_ts: u64, k: usize) -> Vec<(f32, Entry)> 
     out
 }
 
+// ------------------------------------------------------------------ about you (all channels)
+
+/// What you told the app about yourself (first-run questions; editable in Settings). Every agent gets it.
+pub fn you_path() -> PathBuf {
+    let base = model::data_file().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    base.join("memory").join("about-you.md")
+}
+
+pub fn read_you() -> Option<String> {
+    let text = std::fs::read_to_string(you_path()).ok()?;
+    has_content(&text).then(|| text.trim().to_string())
+}
+
+pub fn write_you(text: &str) -> std::io::Result<()> {
+    let p = you_path();
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(p, format!("{}\n", text.trim()))
+}
+
+/// The answers from the first-run questions, as the note agents read.
+pub fn you_note(name: &str, work: &str, projects: &str, languages: &[&str], answers: &str) -> String {
+    let mut t = String::from("# About you\n\n");
+    let line = |t: &mut String, label: &str, v: &str| {
+        if !v.trim().is_empty() {
+            t.push_str(&format!("- {label}: {}\n", v.trim()));
+        }
+    };
+    line(&mut t, "Name", name);
+    line(&mut t, "What I do", work);
+    line(&mut t, "Languages I speak", &languages.join(", "));
+    line(&mut t, "How to answer me", answers);
+    let projects: Vec<&str> = projects.lines().map(|l| l.trim().trim_start_matches(['-', '*']).trim()).filter(|l| !l.is_empty()).collect();
+    if !projects.is_empty() {
+        t.push_str("\n## My projects\n");
+        for p in projects {
+            t.push_str(&format!("- {p}\n"));
+        }
+    }
+    t
+}
+
+/// For prompts: what you told the app about yourself.
+pub fn you_section() -> String {
+    let Some(you) = read_you() else { return String::new() };
+    let body: String = you.lines().filter(|l| !l.starts_with("# ")).collect::<Vec<_>>().join("\n");
+    format!("\n## About the user (they told the app this; use it, e.g. to recognize their projects)\n{}\n", body.trim())
+}
+
+/// Project folders you worked on lately, as suggestions for the first-run questions.
+pub fn recent_projects(dir: &std::path::Path, max: usize) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut dirs: Vec<(std::time::SystemTime, String)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| {
+            let path = e.path();
+            // When it last changed: the folder itself or its git HEAD/index (commits, checkouts).
+            let times = [path.clone(), path.join(".git/index"), path.join(".git/HEAD")];
+            let t = times.iter().filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).max()?;
+            Some((t, e.file_name().to_string_lossy().into_owned()))
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.into_iter().take(max).map(|(_, n)| n).collect()
+}
+
 // ------------------------------------------------------------------ what agents see
 
 /// The channel's note, for the start of a conversation ("" if it says nothing yet).
@@ -696,6 +764,16 @@ mod tests {
         assert!(clean_note("## About the user\n- a\n## Project\n", "site").is_none(), "missing a section");
         assert!(!has_content(&template("site")));
         assert!(has_content(&note));
+    }
+
+    #[test]
+    fn writes_the_about_you_note() {
+        let n = you_note("Sam", "I build apps", "- sample-site — ~/Development/sample-site\n\nMoonbase — moonbase.example\n", &["English", "German"], "Short and direct");
+        assert_eq!(
+            n,
+            "# About you\n\n- Name: Sam\n- What I do: I build apps\n- Languages I speak: English, German\n- How to answer me: Short and direct\n\n## My projects\n- sample-site — ~/Development/sample-site\n- Moonbase — moonbase.example\n"
+        );
+        assert_eq!(you_note("", "", "", &[], ""), "# About you\n\n");
     }
 
     #[test]
