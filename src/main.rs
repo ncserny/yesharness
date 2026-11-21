@@ -5,6 +5,7 @@ mod env;
 mod heartbeat;
 mod icons;
 mod inbox;
+mod memory;
 mod model;
 mod orchestrator;
 mod probe;

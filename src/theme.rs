@@ -141,7 +141,7 @@ fn visuals(t: &Theme) -> Visuals {
     v.faint_bg_color = t.card;
     v.extreme_bg_color = if t.dark { Color32::from_rgb(36, 36, 39) } else { Color32::WHITE };
     v.code_bg_color = t.code_bg;
-    v.window_stroke = Stroke::new(1.0, t.separator);
+    v.window_stroke = Stroke::new(1.0_f32, t.separator);
     v.window_corner_radius = CornerRadius::same(12);
     v.menu_corner_radius = CornerRadius::same(8);
     let shadow = Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if t.dark { 110 } else { 45 }) };
@@ -149,13 +149,13 @@ fn visuals(t: &Theme) -> Visuals {
     v.popup_shadow = Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(if t.dark { 90 } else { 35 }) };
     v.hyperlink_color = t.accent;
     v.selection.bg_fill = t.accent.gamma_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, t.accent);
-    v.text_cursor.stroke = Stroke::new(2.0, t.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, t.accent);
+    v.text_cursor.stroke = Stroke::new(2.0_f32, t.accent);
     v.slider_trailing_fill = true;
 
     let w = &mut v.widgets;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, t.separator);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, t.separator);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, t.text);
     w.noninteractive.bg_fill = t.bg;
     w.noninteractive.weak_bg_fill = t.card;
     w.noninteractive.corner_radius = r6;
@@ -165,17 +165,17 @@ fn visuals(t: &Theme) -> Visuals {
         wv.bg_fill = fill;
         wv.weak_bg_fill = fill;
         wv.bg_stroke = Stroke::NONE;
-        wv.fg_stroke = Stroke::new(1.5, t.text);
+        wv.fg_stroke = Stroke::new(1.5_f32, t.text);
     }
     w.hovered.weak_bg_fill = t.control.gamma_multiply(1.7);
     w.hovered.bg_fill = t.control.gamma_multiply(1.7);
     w.active.weak_bg_fill = t.control.gamma_multiply(2.2);
     w.active.bg_fill = t.control.gamma_multiply(2.2);
-    w.hovered.fg_stroke = Stroke::new(1.5, t.strong);
-    w.active.fg_stroke = Stroke::new(1.5, t.strong);
+    w.hovered.fg_stroke = Stroke::new(1.5_f32, t.strong);
+    w.active.fg_stroke = Stroke::new(1.5_f32, t.strong);
     // Text fields: subtle outline, accent ring when focused.
-    w.inactive.bg_stroke = Stroke::new(1.0, t.separator);
-    w.hovered.bg_stroke = Stroke::new(1.0, t.separator.gamma_multiply(1.6));
-    w.active.bg_stroke = Stroke::new(1.0, t.accent);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, t.separator);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, t.separator.gamma_multiply(1.6));
+    w.active.bg_stroke = Stroke::new(1.0_f32, t.accent);
     v
 }

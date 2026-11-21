@@ -224,6 +224,9 @@ pub struct Settings {
     /// Speech recognition: "apple" (built in) or "parakeet" (Parakeet Ultra, downloaded once).
     #[serde(default = "default_engine")]
     pub stt_engine: String,
+    /// Long-term memory: a note per channel kept by the local model, plus recall of older messages (bge-m3).
+    #[serde(default = "yes")]
+    pub memory: bool,
 }
 
 /// Parakeet Ultra by default: clearly more accurate. Apple's recognizer is used until it's set up.
@@ -248,7 +251,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true }
     }
 }
 

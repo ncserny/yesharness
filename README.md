@@ -120,9 +120,26 @@ straight from the folder (no `git` needed), refreshed every minute and after eac
 
 ### Settings (gear icon)
 - **Appearance:** Automatic (follows macOS), Light or Dark.
+- **Agents:** quick routing for Alex, and long-term memory.
 - **Voice:** always-listening or push-to-talk, read replies, speed, and natural voices. Apple's free
   Premium/Enhanced voices (System Settings → Accessibility → Spoken Content → System voice → Manage Voices…)
   sound far more human. YesHarness picks them up automatically, and the main agent gets the best one.
+
+### Memory
+Each channel has a long-term memory, in the style of [Letta](https://github.com/letta-ai/letta), with no extra
+service, Docker or Ollama required:
+- **A note** with three sections: *About the user*, *Project* and *Decisions*. When a conversation pauses, the
+  local Ollama model rewrites it from what was said, so it costs nothing against your Claude/Codex limits. Every
+  agent gets the note at the start of a conversation. Click the **Memory** chip in the header to read it; edit
+  the file to correct it (your edits are kept).
+- **Recall:** every message is embedded with `bge-m3`, which runs inside YesHarness (int8 ONNX via
+  [fastembed](https://github.com/Anush008/fastembed-rs); no Ollama needed). Each turn, agents get the few older
+  messages most related to your request (beyond what's already in their prompt), not the whole history. The model
+  is downloaded from Hugging Face the first time (~570 MB, progress in the chip) and unloaded when idle.
+- The note is written by a local Ollama model if one is installed; without Ollama, search still works and you can
+  write the note yourself.
+
+Stored in `~/Library/Application Support/YesHarness/memory/<channel>/` (the model in `…/YesHarness/models/`). Turn it off in Settings → Agents → Memory.
 
 ### Heartbeat
 Every minute the app checks each channel's **AGENTS.md**, **TASKS.md** and **docs/**. If something changed, it
@@ -178,6 +195,7 @@ YH_LEAD=codex YH_CODEX_MODEL=gpt-6-sol target/release/yesharness --ask "hi" "wha
 - `src/project.rs`: GitHub / AGENTS.md / TASKS.md / docs detection per channel
 - `src/heartbeat.rs`: the 1-minute watcher for AGENTS.md / TASKS.md / docs
 - `src/inbox.rs`: `--send` / `--new-channel` control of the running app
+- `src/memory.rs`: long-term memory per channel (note kept by a local model, in-app bge-m3 recall)
 - `src/voice.rs` + `helper/dictate.swift`: speech-to-text (push-to-talk, hands-free) and reading replies aloud
 
 Test the speech engine without a microphone:

@@ -145,6 +145,7 @@ impl App {
         );
         heartbeat::start(shared.clone());
         crate::inbox::start(shared.clone());
+        crate::memory::start(shared.clone());
         voice::prepare();
         if shared.data.lock().unwrap().settings.stt_engine == "parakeet" {
             let c = ctx.clone();
@@ -432,7 +433,7 @@ impl eframe::App for App {
             let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("drop-overlay")));
             p.rect_filled(screen, 0.0, Color32::from_black_alpha(if t.dark { 120 } else { 60 }));
             let card = Rect::from_center_size(screen.center(), vec2(280.0, 110.0));
-            p.rect(card, 16.0, t.bg, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+            p.rect(card, 16.0, t.bg, Stroke::new(2.0_f32, t.accent), egui::StrokeKind::Inside);
             p.text(card.center() - vec2(0.0, 12.0), Align2::CENTER_CENTER, "Drop to attach", FontId::proportional(17.0), t.strong);
             p.text(card.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, "Goes with your next message", FontId::proportional(12.5), t.secondary);
         }
@@ -664,7 +665,7 @@ impl eframe::App for App {
                 let capsule = Rect::from_center_size(row.center(), vec2(width, height));
                 let p = ui.painter();
                 p.add(Shadow { offset: [0, 4], blur: 18, spread: 0, color: Color32::from_black_alpha(if t.dark { 70 } else { 22 }) }.as_shape(capsule, 28));
-                p.rect(capsule, 28.0, t.card, Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
+                p.rect(capsule, 28.0, t.card, Stroke::new(1.0_f32, t.separator), egui::StrokeKind::Inside);
 
                 let mut c = ui.new_child(UiBuilder::new().max_rect(capsule.shrink2(vec2(8.0, 8.0))).layout(Layout::left_to_right(Align::Center)));
                 // Mic orb
@@ -763,7 +764,7 @@ impl eframe::App for App {
                         if on {
                             ui.painter().circle_filled(r.center(), 3.0, t.accent);
                         } else {
-                            ui.painter().circle_stroke(r.center(), 2.8, Stroke::new(1.0, t.tertiary));
+                            ui.painter().circle_stroke(r.center(), 2.8, Stroke::new(1.0_f32, t.tertiary));
                         }
                         let rt = RichText::new(label).size(11.5).color(if on { t.secondary } else { t.tertiary });
                         if ui.add(egui::Label::new(rt).sense(Sense::click())).on_hover_text(tip).clicked() && !on {
@@ -795,6 +796,7 @@ impl eframe::App for App {
             .frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 0)))
             .show(ctx, |ui| {
                 window_drag(ui, ui.max_rect(), "header-drag");
+                let memory_on = data.settings.memory;
                 let Data { agents, channels, selected, .. } = &mut *data;
                 let Some(idx) = channels.iter().position(|c| c.id == cid) else { return };
                 let mut delete = false;
@@ -825,7 +827,7 @@ impl eframe::App for App {
                     }
                     });
                     ui.add_space(1.0);
-                    project_chips(ui, &t, &project, &ch.folder, &cid, &mut actions);
+                    project_chips(ui, &t, &project, &ch.folder, &cid, memory_on, &mut actions);
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1306,7 +1308,7 @@ fn panel_ui(ui: &mut egui::Ui, t: &Theme, panel: &mut Panel) -> bool {
     });
     ui.add_space(6.0);
     let r = ui.available_rect_before_wrap();
-    ui.painter().hline(r.left()..=r.right(), r.top(), Stroke::new(1.0, t.separator));
+    ui.painter().hline(r.left()..=r.right(), r.top(), Stroke::new(1.0_f32, t.separator));
     ui.add_space(8.0);
 
     // Body
@@ -1448,11 +1450,11 @@ fn task_row(ui: &mut egui::Ui, t: &Theme, done: bool, text: &str, indent: f32) -
         let p = ui.painter();
         if done {
             p.rect_filled(b, 4.0, t.accent);
-            let w = Stroke::new(1.8, Color32::WHITE);
+            let w = Stroke::new(1.8_f32, Color32::WHITE);
             p.line_segment([b.left_center() + vec2(3.0, 0.5), b.center() + vec2(-1.0, 3.5)], w);
             p.line_segment([b.center() + vec2(-1.0, 3.5), b.right_top() + vec2(-3.0, 3.5)], w);
         } else {
-            p.rect_stroke(b, 4.0, Stroke::new(1.3, if resp.hovered() { t.accent } else { t.tertiary }), egui::StrokeKind::Inside);
+            p.rect_stroke(b, 4.0, Stroke::new(1.3_f32, if resp.hovered() { t.accent } else { t.tertiary }), egui::StrokeKind::Inside);
         }
         if resp.on_hover_text(if done { "Mark as not done" } else { "Mark as done" }).clicked() {
             clicked = true;
@@ -1460,7 +1462,7 @@ fn task_row(ui: &mut egui::Ui, t: &Theme, done: bool, text: &str, indent: f32) -
         let fmt = TextFormat {
             font_id: FontId::proportional(13.5),
             color: if done { t.tertiary } else { t.text },
-            strikethrough: if done { Stroke::new(1.0, t.tertiary) } else { Stroke::NONE },
+            strikethrough: if done { Stroke::new(1.0_f32, t.tertiary) } else { Stroke::NONE },
             line_height: Some(19.0),
             ..Default::default()
         };
@@ -1516,7 +1518,7 @@ fn open_path(p: &std::path::Path) {
 }
 
 /// Git/GitHub, AGENTS.md, TASKS.md and docs at a glance. Missing pieces are one click away.
-fn project_chips(ui: &mut egui::Ui, t: &Theme, p: &crate::project::ProjectInfo, folder: &str, cid: &str, actions: &mut Vec<Action>) {
+fn project_chips(ui: &mut egui::Ui, t: &Theme, p: &crate::project::ProjectInfo, folder: &str, cid: &str, memory_on: bool, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         let good = (t.text, t.control);
@@ -1595,7 +1597,40 @@ fn project_chips(ui: &mut egui::Ui, t: &Theme, p: &crate::project::ProjectInfo, 
         } else {
             chip(ui, "No docs", dim.0, dim.1, "No docs/ folder yet.");
         }
+        if memory_on {
+            memory_chip(ui, t, cid, actions);
+        }
     });
+}
+
+/// Long-term memory: setup progress, or the channel's note (click to read it).
+fn memory_chip(ui: &mut egui::Ui, t: &Theme, cid: &str, actions: &mut Vec<Action>) {
+    use crate::memory::{self, Status};
+    let good = (t.text, t.control);
+    let dim = (t.tertiary, t.control.gamma_multiply(0.6));
+    let warn = (t.amber, t.amber.gamma_multiply(0.14));
+    let has_note = memory::read_blocks(cid).is_some();
+    let open = |actions: &mut Vec<Action>| actions.push(Action::ShowFile(memory::blocks_path(cid)));
+    match memory::status() {
+        Status::Downloading(pct) => {
+            chip(ui, &format!("Memory: downloading bge-m3 {pct}%"), warn.0, warn.1, "Downloading the search model for memory (~570 MB, once). It runs inside YesHarness.");
+        }
+        Status::Failed(e) => {
+            let tip = format!("Couldn't set up bge-m3: {e}. Trying again in a few minutes.");
+            if chip(ui, "Memory search off", warn.0, warn.1, &tip).clicked() && has_note {
+                open(actions);
+            }
+        }
+        Status::Starting | Status::Ready => {
+            if has_note {
+                if chip(ui, "Memory", good.0, good.1, "What the team remembers about you and this project. Click to read; edit the file to correct it.").clicked() {
+                    open(actions);
+                }
+            } else {
+                chip(ui, "Memory: empty", dim.0, dim.1, "Older messages are searchable. The note is written by a local model (Ollama) when one is installed.");
+            }
+        }
+    }
 }
 
 const ASK_AGENTS_MD: &str = "Please write an AGENTS.md for this project: what it is, how it's organized, how to run, build and \
@@ -1689,7 +1724,7 @@ fn group<R>(ui: &mut egui::Ui, t: &Theme, title: &str, add: impl FnOnce(&mut egu
     }
     let r = Frame::new()
         .fill(t.card)
-        .stroke(Stroke::new(1.0, t.separator))
+        .stroke(Stroke::new(1.0_f32, t.separator))
         .corner_radius(10)
         .inner_margin(Margin::symmetric(14, 8))
         .show(ui, |ui| {
@@ -1712,7 +1747,7 @@ fn form_row(ui: &mut egui::Ui, t: &Theme, label: &str, add: impl FnOnce(&mut egu
 
 fn form_sep(ui: &mut egui::Ui, t: &Theme) {
     let r = ui.available_rect_before_wrap();
-    ui.painter().hline(r.left()..=r.right(), r.top() + 1.0, Stroke::new(1.0, t.separator));
+    ui.painter().hline(r.left()..=r.right(), r.top() + 1.0, Stroke::new(1.0_f32, t.separator));
     ui.add_space(3.0);
 }
 
@@ -1724,7 +1759,7 @@ impl App {
         let sheet_frame = Frame::new()
             .fill(t.bg)
             .corner_radius(12)
-            .stroke(Stroke::new(1.0, t.separator))
+            .stroke(Stroke::new(1.0_f32, t.separator))
             .shadow(Shadow { offset: [0, 12], blur: 40, spread: 0, color: Color32::from_black_alpha(if t.dark { 140 } else { 60 }) });
         let backdrop = Color32::from_black_alpha(if t.dark { 110 } else { 50 });
 
@@ -1760,6 +1795,10 @@ impl App {
                         form_row(ui, t, "Quick routing", |ui| {
                             toggle(ui, t, &mut data.settings.quick_routing);
                             ui.label(RichText::new("Alex answers and delegates in one cheap call; uses full tools only when needed").size(12.0).color(t.secondary));
+                        });
+                        form_row(ui, t, "Memory", |ui| {
+                            toggle(ui, t, &mut data.settings.memory);
+                            ui.label(RichText::new("Remembers you and each project between conversations, on this Mac (Ollama + bge-m3)").size(12.0).color(t.secondary));
                         });
                     });
                     group(ui, t, "Voice", |ui| {
@@ -2124,7 +2163,7 @@ impl App {
                                 for c in PALETTE {
                                     let (r, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
                                     if a.color == c {
-                                        ui.painter().circle_stroke(r.center(), 9.0, Stroke::new(2.0, color(c)));
+                                        ui.painter().circle_stroke(r.center(), 9.0, Stroke::new(2.0_f32, color(c)));
                                     }
                                     ui.painter().circle_filled(r.center(), 6.5, color(c));
                                     if resp.clicked() {

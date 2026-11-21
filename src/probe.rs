@@ -139,11 +139,8 @@ fn probe_local(h: &mut Health) {
     }
     let mut tags = ollama_tags();
     if tags.is_none() {
-        // Not running: start it (the Ollama app runs the server), give it a few seconds.
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("open").args(["-g", "-a", "Ollama"]).status();
-        #[cfg(not(target_os = "macos"))]
-        let _ = env::command("ollama").arg("serve").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        // Not running: start it, give it a few seconds.
+        start_ollama();
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(500));
             tags = ollama_tags();
@@ -173,8 +170,16 @@ fn probe_local(h: &mut Health) {
     h.models = names.iter().enumerate().map(|(i, n)| ModelInfo { id: n.clone(), name: n.clone(), is_default: i == 0, hidden: false }).collect();
 }
 
+/// Starts the Ollama server in the background (the Ollama app on macOS).
+pub fn start_ollama() {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").args(["-g", "-a", "Ollama"]).status();
+    #[cfg(not(target_os = "macos"))]
+    let _ = env::command("ollama").arg("serve").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
 /// GET http://127.0.0.1:11434/api/tags without an HTTP library.
-fn ollama_tags() -> Option<Value> {
+pub fn ollama_tags() -> Option<Value> {
     use std::io::Read;
     let mut s = std::net::TcpStream::connect_timeout(&"127.0.0.1:11434".parse().ok()?, Duration::from_millis(800)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
