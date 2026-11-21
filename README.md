@@ -44,6 +44,9 @@ hands it out to the specialists, then tells you how it went.
 - **Nobody waits:** each message is handled right away, even while teammates work on earlier ones. An agent runs
   one turn at a time; if the one needed is busy, a **General helper** steps in. It's created automatically, runs
   on the main agent's engine, and starts extra copies (up to four) when it's busy too.
+- **Quick routing (on by default):** Alex's routine turns (answering, delegating, reporting back) are one
+  Codex call with short instructions and no tools, about 13k tokens instead of 20–80k. When Alex needs to look at
+  the project itself, it says `/work` and that turn re-runs with full tools. Switch it in Settings → Agents.
 - **Token limits:** every tool step re-sends the whole conversation, so long loops get expensive fast.
   - **Steps per turn:** Alex stops after 8 steps (it should hand work off, not investigate), General after 15,
     specialists after 30.

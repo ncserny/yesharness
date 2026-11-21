@@ -1756,6 +1756,12 @@ impl App {
                         });
                         ui.label(RichText::new("Automatic follows your Mac's light or dark appearance.").size(11.5).color(t.secondary));
                     });
+                    group(ui, t, "Agents", |ui| {
+                        form_row(ui, t, "Quick routing", |ui| {
+                            toggle(ui, t, &mut data.settings.quick_routing);
+                            ui.label(RichText::new("Alex answers and delegates in one cheap call; uses full tools only when needed").size(12.0).color(t.secondary));
+                        });
+                    });
                     group(ui, t, "Voice", |ui| {
                         form_row(ui, t, "Listening", |ui| {
                             let cur = if data.settings.hands_free { 0 } else { 1 };

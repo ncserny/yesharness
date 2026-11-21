@@ -563,11 +563,40 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
     } else {
         Vec::new()
     };
+    // Router mode: the main agent's routine turns are one cheap, tool-free call. "/work" = it needs its tools.
+    let mut routed: Option<(agents::Outcome, Option<String>)> = None;
+    let mut router_tokens = 0u64;
+    let quick = shared.data.lock().unwrap().settings.quick_routing;
+    let is_main = members.first().is_some_and(|m| m.id == agent.id);
+    if quick && inst == 0 && is_main && eff.kind == AgentKind::Codex && images.is_empty() && matches!(mode, Mode::User | Mode::FollowUp) {
+        let prompt = {
+            let data = shared.data.lock().unwrap();
+            data.channel(cid).map(|ch| build_router_prompt(ch, &agent, &members, &data, &mode, read_aloud, shared)).unwrap_or_default()
+        };
+        let model = probe::pick_model(&eff, shared.health_of(&eff).as_ref());
+        shared.set_status(cid, &agent.handle, "thinking…".into());
+        let r = agents::run_router(&folder, &prompt, model.as_deref(), &ctl);
+        if cancel.load(Ordering::Relaxed) {
+            shared.done_working(cid, &agent.handle);
+            return;
+        }
+        if !r.error && !agents::wants_full_agent(&r.text) {
+            routed = Some((r, model));
+        } else {
+            router_tokens = r.receipt.tokens;
+            shared.set_status(cid, &agent.handle, "looking at the project…".into());
+        }
+    }
+
     // Extra helper copies start fresh each time (two copies can't share one CLI session).
     let mut session = if eff.kind.supports_sessions() && inst == 0 { sessions.get(&session_key(&eff)).cloned() } else { None };
     let mut out;
     let mut used_model;
     let mut tries = 0;
+    if let Some((r, m)) = routed {
+        out = r;
+        used_model = m;
+    } else {
     loop {
         tries += 1;
         used_model = probe::pick_model(&eff, shared.health_of(&eff).as_ref());
@@ -615,6 +644,8 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
             Failure::Other => break,
         }
     }
+    }
+    out.receipt.tokens += router_tokens;
     shared.done_working(cid, &agent.handle);
     if let Some(r) = shared.runs.lock().unwrap().get(cid) {
         r.pids.lock().unwrap().retain(|p| !Arc::ptr_eq(p, &pid));
@@ -860,6 +891,59 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
             names.join(", ")
         ));
     }
+    p
+}
+
+/// Router-mode prompt: briefing, team, facts and the recent conversation, kept small (one call, no tools).
+#[allow(clippy::too_many_arguments)]
+fn build_router_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: &Mode, read_aloud: bool, shared: &Shared) -> String {
+    let mut p = format!(
+        "You are {} (@{}), the main agent in channel #{}. Project folder: {}.\n",
+        me.name(),
+        me.handle,
+        ch.name,
+        ch.folder
+    );
+    if !me.briefing.trim().is_empty() {
+        p.push_str(&format!("\n## Your briefing\n{}\n", me.briefing.trim()));
+    }
+    let others: Vec<&Agent> = members.iter().filter(|a| a.id != me.id && shared.effective(a).is_some()).collect();
+    p.push_str("\n## Your team (hand off with a line \"@name: brief\")\n");
+    for a in &others {
+        let desc = if a.description.is_empty() { a.kind.label().to_string() } else { a.description.clone() };
+        p.push_str(&format!("- {}: {}\n", a.label(), desc));
+    }
+    p.push_str(&facts(ch, me, data, shared));
+    p.push_str("\n## Recent conversation\n");
+    let start = ch.messages.len().saturating_sub(12);
+    for m in &ch.messages[start..] {
+        let who = match &m.author {
+            Author::User => "User".to_string(),
+            Author::Agent(id) if *id == me.id => "You".to_string(),
+            Author::Agent(id) => data.agent(id).map(|a| a.label()).unwrap_or_else(|| "@agent".into()),
+            Author::Heartbeat => "Heartbeat".to_string(),
+            Author::System => continue,
+        };
+        let text: String = if m.error {
+            format!("(failed: {})", agents::short(m.text.lines().next().unwrap_or_default(), 160))
+        } else if m.text.chars().count() > 600 {
+            format!("{}… [trimmed]", m.text.chars().take(600).collect::<String>())
+        } else {
+            m.text.clone()
+        };
+        p.push_str(&format!("**{who}:** {text}\n\n"));
+    }
+    p.push_str("## Your turn\n");
+    p.push_str(match mode {
+        Mode::FollowUp => "Your teammates replied above. Check their results: if done, tell the user in one or two sentences what \
+                           happened and where to find it; if something is missing, hand it off again.",
+        _ => "Reply to the user's latest message.",
+    });
+    if read_aloud {
+        p.push_str(" Your reply is read aloud: plain spoken sentences.");
+    }
+    let names: Vec<String> = data.channels.iter().map(|c| format!("#{}", c.name)).collect();
+    p.push_str(&format!("\nExisting channels: {}.", names.join(", ")));
     p
 }
 
@@ -1351,6 +1435,24 @@ mod tests {
         let d = Data::default();
         assert_eq!(d.agents[0].step_cap(), 8, "main agent routes, it shouldn't investigate");
         assert_eq!(d.agents[1].step_cap(), 30);
+    }
+
+    #[test]
+    fn router_prompt_is_compact_and_escalates_with_work() {
+        let mut data = Data::default();
+        for i in 0..40 {
+            data.channels[0].messages.push(Message::system(format!("note {i}")));
+            data.channels[0].messages.push(Message { author: Author::User, text: "x".repeat(2000), ts: 0, error: false, to_user: false, via: String::new(), attachments: Vec::new(), receipt: String::new(), idle_claim: false });
+        }
+        let shared = Shared::quiet(data.clone());
+        let ch = &data.channels[0];
+        let members = data.members(ch);
+        let p = build_router_prompt(ch, &members[0], &members, &data, &Mode::User, true, &shared);
+        assert!(p.contains("@writer") && p.contains("## Facts from the app"), "{p}");
+        assert!(p.len() < 12_000, "router prompt should stay small, got {} chars", p.len());
+        assert!(agents::wants_full_agent("/work"));
+        assert!(agents::wants_full_agent("I need to look.\n`/work`"));
+        assert!(!agents::wants_full_agent("I'll work on it via @developer"));
     }
 
     #[test]

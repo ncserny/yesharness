@@ -235,6 +235,53 @@ fn describe_tool(name: &str, input: &Value) -> String {
 
 // ---------------------------------------------------------------- Codex
 
+/// Instructions for router mode: no tools, one call, decide and answer.
+pub const ROUTER_INSTRUCTIONS: &str = "You are the coordinator of a small team of AI agents in the YesHarness app. \
+In this mode you have NO tools: you can't read files, run commands or browse. You can:\n\
+1. Answer directly when the conversation, the facts and your briefing are enough.\n\
+2. Hand work to a teammate with a line that starts with \"@name:\" followed by a complete, self-contained brief \
+(goal, where files live, what done looks like). Several such lines hand work to several teammates at once.\n\
+3. Use app actions on their own lines: /new-channel <name> [folder], /send <channel> <message>, /switch <channel>.\n\
+If you must look at the project files or the web yourself to answer, reply with exactly /work on its own line \
+and nothing else: you'll then get your full tools for this turn.\n\
+Prefer handing real work to the teammate whose role fits. Be very concise: one or two short sentences. Never say \
+work is happening unless you hand it off in this reply or the facts show it.";
+
+/// Router mode: one cheap Codex call with short instructions and no tools (~12k tokens instead of ~20k per
+/// call, and never a multi-step loop). Stateless: the prompt carries the recent conversation.
+pub fn run_router(folder: &Path, prompt: &str, model: Option<&str>, ctl: &Ctl) -> Outcome {
+    let instr = crate::model::data_file().parent().map(|p| p.join("router-instructions.md")).unwrap_or_else(|| "router-instructions.md".into());
+    let _ = std::fs::write(&instr, ROUTER_INSTRUCTIONS);
+    let mut cmd = env::command("codex");
+    cmd.current_dir(folder).arg("exec");
+    cmd.args(["--json", "--skip-git-repo-check", "--ignore-user-config", "--ephemeral"]);
+    cmd.args(["-c", &format!("model_instructions_file=\"{}\"", instr.display())]);
+    cmd.args(["-c", "sandbox_mode=\"read-only\"", "-c", "model_reasoning_effort=\"low\""]);
+    for f in ["shell_tool", "unified_exec", "apps", "plugins", "goals", "image_generation", "view_image", "tool_suggest"] {
+        cmd.args(["--disable", f]);
+    }
+    if let Some(m) = model {
+        cmd.args(["-m", m]);
+    }
+    cmd.arg(prompt);
+    let mut p = CodexParser::default();
+    let res = stream(cmd, None, ctl, |line| {
+        if let Some(st) = p.feed(line) {
+            (ctl.status)(st);
+        }
+    });
+    let is_error = p.error.is_some() && p.last_text.is_none();
+    let text = if is_error { p.error.clone() } else { p.last_text.clone() };
+    let mut out = finish("codex (quick)", res, None, text, is_error, 0, ctl);
+    out.receipt = p.receipt;
+    out
+}
+
+/// The router asked for its full tools.
+pub fn wants_full_agent(text: &str) -> bool {
+    text.lines().any(|l| l.trim().trim_matches('`') == "/work")
+}
+
 /// `local`: run Codex against a model on this Mac (Ollama) instead of OpenAI's servers.
 #[allow(clippy::too_many_arguments)]
 fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, model: Option<&str>, local: bool, images: &[String], ctl: &Ctl) -> Outcome {
@@ -256,6 +303,12 @@ fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, 
     }
     // Keep the context small: every step re-sends it. Trim long command output, compact long conversations.
     cmd.args(["-c", "tool_output_token_limit=4000", "-c", "model_auto_compact_token_limit=60000"]);
+    if !agent.use_my_plugins {
+        // Codex extras our agents never use; each adds tool descriptions to every step.
+        for f in ["apps", "plugins", "goals", "image_generation", "tool_suggest"] {
+            cmd.args(["--disable", f]);
+        }
+    }
     for img in images.iter().filter(|p| Path::new(p).is_file()) {
         cmd.args(["-i", img]);
     }
