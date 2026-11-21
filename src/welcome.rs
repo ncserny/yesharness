@@ -59,6 +59,9 @@ pub struct Welcome {
     /// Answers arrive here; we move on a moment later so you can see what was understood.
     advance_at: Option<Instant>,
     projects_dir: String,
+    /// On the last screen: when Alex finished talking (then we go straight into the app).
+    quiet_since: Option<Instant>,
+    finish: bool,
 }
 
 impl Welcome {
@@ -87,6 +90,8 @@ impl Welcome {
             started: Instant::now(),
             advance_at: None,
             projects_dir: projects_dir.to_string(),
+            quiet_since: None,
+            finish: false,
         }
     }
 
@@ -130,8 +135,24 @@ impl Welcome {
             return;
         }
         let lower = text.to_lowercase();
+        let bare = lower.trim_matches(|c: char| !c.is_alphanumeric());
+        // "Next" / "skip" / "let's go" move on from any question.
+        if ["next", "skip", "skip it", "continue", "let's go", "lets go", "go", "weiter"].contains(&bare) {
+            if self.step() == Step::Done {
+                self.finish = true;
+            } else {
+                self.next();
+            }
+            return;
+        }
         match self.step() {
-            Step::Name => self.name = parse_name(text, &self.name_guess),
+            Step::Name => {
+                let n = parse_name(text, &self.name_guess);
+                if n.is_empty() {
+                    return; // not a name: keep listening
+                }
+                self.name = n;
+            }
             Step::Work => self.work = text.to_string(),
             Step::Projects => {
                 let (found, other) = match_projects(text, &self.all_folders);
@@ -159,7 +180,10 @@ impl Welcome {
                     self.langs = said;
                 }
             }
-            Step::Done => return,
+            Step::Done => {
+                self.finish = true;
+                return;
+            }
         }
         self.heard = text.to_string();
         self.advance_at = Some(Instant::now());
@@ -201,6 +225,17 @@ impl Welcome {
         let mut outcome = Outcome::Continue;
         if self.advance_at.is_some_and(|t| t.elapsed().as_millis() > 1100) {
             self.next();
+        }
+        // The last screen doesn't wait for a click: once Alex has said goodbye, you're in.
+        if self.step() == Step::Done {
+            if speaking {
+                self.quiet_since = None;
+            } else if self.spoken && self.quiet_since.is_none() {
+                self.quiet_since = Some(Instant::now());
+            }
+            if self.finish || self.quiet_since.is_some_and(|t| t.elapsed().as_millis() > 700) {
+                return Outcome::Finished(self.note(), self.langs.clone());
+            }
         }
         let time = self.started.elapsed().as_secs_f32();
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
@@ -352,12 +387,28 @@ pub fn parse_name(text: &str, guess: &str) -> String {
     if !guess.is_empty() && (yes.iter().any(|y| lower == *y || lower.starts_with(&format!("{y},")) || lower.starts_with(&format!("{y} "))) || lower.contains(&first(guess).to_lowercase())) {
         return first(guess).to_string();
     }
+    // Names get misheard ("Nader" -> "Another"): a short answer that sounds like your Mac's name is that name.
+    let g = norm(first(guess));
+    if g.len() >= 3 && t.split_whitespace().count() <= 2 && sounds_like(&norm(t), &g) {
+        return first(guess).to_string();
+    }
     let mut rest = t;
+    let mut explicit = false;
     for p in ["my name is", "my name's", "i'm", "i am", "call me", "it's", "it is", "this is", "ich bin", "ich heiße", "nenn mich"] {
         if let Some(i) = lower.find(p) {
             rest = t[i + p.len()..].trim();
+            explicit = true;
             break;
         }
+    }
+    // Without "my name is …", only a word or two can be a name; ordinary words are just noise.
+    const NOT_NAMES: [&str; 24] = [
+        "another", "okay", "ok", "hello", "hi", "hey", "um", "uh", "hmm", "so", "well", "no", "yes", "thanks", "thank",
+        "you", "the", "a", "and", "what", "next", "sorry", "alex", "nothing",
+    ];
+    let plain: Vec<String> = rest.split_whitespace().map(|w| w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string()).collect();
+    if !explicit && (plain.len() > 2 || plain.iter().any(|w| NOT_NAMES.contains(&w.as_str()))) {
+        return String::new();
     }
     let words: Vec<&str> = rest.split_whitespace().take(3).map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')).filter(|w| !w.is_empty()).collect();
     let name = words.iter().take(2).map(|w| {
@@ -365,6 +416,19 @@ pub fn parse_name(text: &str, guess: &str) -> String {
         c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
     });
     name.collect::<Vec<_>>().join(" ")
+}
+
+/// Most of the name's letters appear, in order, in what was heard.
+fn sounds_like(heard: &str, name: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (heard.chars().collect(), name.chars().collect());
+    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in 0..a.len() {
+        for j in 0..b.len() {
+            dp[i + 1][j + 1] = if a[i] == b[j] { dp[i][j] + 1 } else { dp[i][j + 1].max(dp[i + 1][j]) };
+        }
+    }
+    let common = dp[a.len()][b.len()];
+    common >= 3 && common * 10 >= b.len() * 6 && a.len() <= b.len() * 2
 }
 
 fn norm(s: &str) -> String {
@@ -559,6 +623,11 @@ mod tests {
         assert_eq!(parse_name("My name is alex smith", ""), "Alex Smith");
         assert_eq!(parse_name("Just call me Kim.", "Sam Doe"), "Kim");
         assert_eq!(parse_name("Sam", "Sam Doe"), "Sam");
+        assert_eq!(parse_name("Another.", "Sam Doe"), "", "not a name");
+        assert_eq!(parse_name("Another.", "Vader Example"), "Vader", "misheard: sounds like the Mac's name");
+        assert_eq!(parse_name("Samuel", "Sam Doe"), "Sam");
+        assert_eq!(parse_name("I think we should start with the website", ""), "");
+        assert_eq!(parse_name("Kim", ""), "Kim");
     }
 
     #[test]
@@ -585,6 +654,8 @@ mod tests {
         w.next();
         w.hear("English and German");
         w.next();
+        w.hear("let's go");
+        assert!(w.finish, "saying let's go finishes");
         let note = w.note();
         assert!(note.contains("- Name: Sam Doe") || note.contains("- Name: Sam"), "{note}");
         assert!(note.contains("I build apps for small shops") && note.contains("Moonbase") && note.contains("English, German"), "{note}");
