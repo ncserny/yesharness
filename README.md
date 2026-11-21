@@ -189,8 +189,10 @@ them up within a moment, which makes it easy to script, or to use from Shortcuts
 
 ## Versions
 
-Every pull request merged into `main` bumps the version by 0.1 (0.2 → 0.3 … 0.9 → 1.0) and tags it, via
-`.github/workflows/bump-version.yml` and `scripts/bump_version.py`. Label a PR `no-bump` to skip.
+Every pull request merged into `main` gets the next version (+0.1: 1.4 → 1.5 … 1.9 → 2.0) as a git tag on its merge
+commit, and a GitHub release with the macOS app built from that tag (`.github/workflows/bump-version.yml`,
+`scripts/bump_version.py`). The version lives in the tags, not in commits, so `main` only changes through pull
+requests. `scripts/bundle.sh` stamps the latest tag into local builds. Label a PR `no-bump` to skip.
 
 ## Troubleshooting from Terminal
 
