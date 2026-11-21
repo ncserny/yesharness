@@ -37,6 +37,8 @@ pub struct Run {
     pub working: Vec<(String, String)>,
     pub started: Instant,
     pub queue: VecDeque<String>,
+    /// Messages being handled right now in this channel (they run side by side).
+    pub active: usize,
 }
 
 type Hook<T> = Box<dyn Fn(T) + Send + Sync>;
@@ -62,6 +64,8 @@ pub struct Shared {
     pub notify: Hook<String>,
     /// Agent id -> stand-in engine we already told the user about.
     pub engine_notes: Mutex<HashMap<String, AgentKind>>,
+    /// "{channel}:{agent}" -> held while that agent runs a turn there (an agent never runs two turns at once).
+    pub agent_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Shared {
@@ -81,6 +85,7 @@ impl Shared {
             speak,
             notify,
             engine_notes: Mutex::new(HashMap::new()),
+            agent_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -171,44 +176,80 @@ pub fn send_with(shared: &Arc<Shared>, cid: &str, text: String, attachments: Vec
     }
     shared.dirty.store(true, Ordering::Relaxed);
     (shared.repaint)();
-    let mut runs = shared.runs.lock().unwrap();
-    if let Some(run) = runs.get_mut(cid) {
-        // Agents are busy in this channel: handle it right after.
-        run.queue.push_back(text);
-        return;
-    }
-    runs.insert(
-        cid.to_string(),
-        Run {
-            cancel: Arc::new(AtomicBool::new(false)),
-            pids: Arc::new(Mutex::new(Vec::new())),
-            working: Vec::new(),
-            started: Instant::now(),
-            queue: VecDeque::new(),
-        },
-    );
-    drop(runs);
-    let shared = shared.clone();
-    let cid = cid.to_string();
-    std::thread::spawn(move || {
-        let mut next = Some(text);
-        while let Some(t) = next {
-            handle(&shared, &cid, &t);
-            shared.refresh_project(&cid); // agents may have added AGENTS.md, tasks, docs…
-            let mut runs = shared.runs.lock().unwrap();
-            next = match runs.get_mut(&cid) {
-                Some(r) if !r.cancel.load(Ordering::Relaxed) => {
-                    r.started = Instant::now();
-                    r.queue.pop_front()
-                }
-                _ => None,
-            };
-            if next.is_none() {
-                runs.remove(&cid);
+    // Every message is handled right away, even while teammates are still working on earlier ones.
+    {
+        let mut runs = shared.runs.lock().unwrap();
+        match runs.get_mut(cid) {
+            Some(r) if r.cancel.load(Ordering::Relaxed) => {
+                // You just pressed Stop: start this one once the stopped work has wound down.
+                drop(runs);
+                let shared = shared.clone();
+                let cid = cid.to_string();
+                std::thread::spawn(move || {
+                    while shared.runs.lock().unwrap().contains_key(&cid) {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    start_handler(&shared, &cid, text);
+                });
+                return;
+            }
+            Some(r) => r.active += 1,
+            None => {
+                runs.insert(
+                    cid.to_string(),
+                    Run {
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        pids: Arc::new(Mutex::new(Vec::new())),
+                        working: Vec::new(),
+                        started: Instant::now(),
+                        queue: VecDeque::new(),
+                        active: 1,
+                    },
+                );
             }
         }
-        (shared.repaint)();
-    });
+    }
+    let shared = shared.clone();
+    let cid = cid.to_string();
+    std::thread::spawn(move || run_handler(&shared, &cid, &text));
+}
+
+/// Register a handler on the channel's run and start it.
+fn start_handler(shared: &Arc<Shared>, cid: &str, text: String) {
+    {
+        let mut runs = shared.runs.lock().unwrap();
+        match runs.get_mut(cid) {
+            Some(r) => r.active += 1,
+            None => {
+                runs.insert(
+                    cid.to_string(),
+                    Run {
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        pids: Arc::new(Mutex::new(Vec::new())),
+                        working: Vec::new(),
+                        started: Instant::now(),
+                        queue: VecDeque::new(),
+                        active: 1,
+                    },
+                );
+            }
+        }
+    }
+    run_handler(shared, cid, &text);
+}
+
+fn run_handler(shared: &Arc<Shared>, cid: &str, text: &str) {
+    handle(shared, cid, text);
+    shared.refresh_project(cid); // agents may have added AGENTS.md, tasks, docs…
+    let mut runs = shared.runs.lock().unwrap();
+    if let Some(r) = runs.get_mut(cid) {
+        r.active = r.active.saturating_sub(1);
+        if r.active == 0 {
+            runs.remove(cid);
+        }
+    }
+    drop(runs);
+    (shared.repaint)();
 }
 
 pub fn stop(shared: &Arc<Shared>, cid: &str) {
@@ -277,7 +318,10 @@ fn handle(shared: &Arc<Shared>, cid: &str, text: &str) {
         turn(shared, cid, &t, Mode::User, &turns, 0);
     }
     if shared.cancelled(cid) {
-        shared.post(cid, Author::System, "Stopped.".into(), false);
+        let already = shared.data.lock().unwrap().channel(cid).and_then(|c| c.messages.last()).is_some_and(|m| m.text == "Stopped.");
+        if !already {
+            shared.post(cid, Author::System, "Stopped.".into(), false);
+        }
     }
 }
 
@@ -398,6 +442,20 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
         t.budget -= 1;
     }
     shared.activity.lock().unwrap().entry(cid.to_string()).or_default().insert(agent.handle.clone());
+
+    // One turn at a time per agent (its CLI session can't take two at once); others keep working meanwhile.
+    let lock = shared.agent_locks.lock().unwrap().entry(format!("{cid}:{}", agent.id)).or_default().clone();
+    let guard = match lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            shared.set_status(cid, &agent.handle, "finishing its previous turn first…".into());
+            lock.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    };
+    if shared.cancelled(cid) {
+        shared.done_working(cid, &agent.handle);
+        return;
+    }
 
     // Snapshot what we need, then release the lock while the agent works.
     let (members, folder, sessions, read_aloud, voice_name) = {
@@ -563,6 +621,7 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
     }
     shared.dirty.store(true, Ordering::Relaxed);
     (shared.repaint)();
+    drop(guard); // follow-ups and handoffs take their own turns
     run_app_actions(shared, cid, &actions);
 
     if out.error {
@@ -1006,7 +1065,9 @@ fn facts(ch: &Channel, me: &Agent, data: &Data, shared: &Shared) -> String {
          Working right now besides you: {}.\n\
          What agents actually did in their recent turns (newest first):\n{}\n\
          Work only happens when someone runs commands, edits files, or you hand it off with a line \"@name: task\". \
-         Never say work is in progress unless it shows up here or you start it in this reply.\n",
+         Never say work is in progress unless it shows up here or you start it in this reply.\n\
+         If teammates are still busy with earlier requests, don't wait for them: answer the user's newest message now \
+         (do it yourself or hand it to someone who is free).\n",
         if working.is_empty() { "nobody".to_string() } else { working.join(", ") },
         if recent.is_empty() { "- nothing yet".to_string() } else { recent.join("\n") }
     )
@@ -1147,6 +1208,26 @@ mod tests {
         assert!(first.idle_claim);
         let handoff = data.channels[0].messages.iter().find(|m| m.text.starts_with("@helper")).unwrap();
         assert!(handoff.receipt.contains("handed off to helper") && !handoff.idle_claim, "{}", handoff.receipt);
+    }
+
+    /// You ask something quick while a teammate is busy with a slow task: the lead answers right away.
+    #[test]
+    fn answers_new_messages_while_teammates_work() {
+        let lead = agent(
+            "L",
+            "lead",
+            r#"input=$(cat); if printf '%s' "$input" | grep -q 'have replied above'; then echo "All done"; elif printf '%s' "$input" | grep -q 'quick question'; then echo "quick answer"; else echo "@helper: slow task"; fi"#,
+        );
+        let helper = agent("H", "helper", r#"cat >/dev/null; sleep 3; echo "slow done""#);
+        let data = Data { agents: vec![lead, helper], channels: vec![channel(&["L", "H"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "do the slow thing".into());
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        send(&shared, "c", "quick question: is the domain free?".into());
+        let msgs = wait(&shared);
+        let pos = |t: &str| msgs.iter().position(|(_, m)| m == t).unwrap_or_else(|| panic!("missing {t}: {msgs:#?}"));
+        assert!(pos("quick answer") < pos("slow done"), "the quick question waited for the slow task: {msgs:#?}");
+        assert_eq!(msgs.iter().filter(|(_, m)| m == "All done").count(), 1);
     }
 
     #[test]
