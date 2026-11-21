@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "› Building app (release)…"
+# Don't bake your home folder path into the binary (it shows up in panic locations).
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~"
 cargo build --locked --release
 
 echo "› Building voice helper…"
