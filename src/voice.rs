@@ -143,10 +143,13 @@ pub fn setup_parakeet(repaint: impl Fn() + Send + 'static) {
 impl Dictation {
     /// `words`: names to recognise better (agents, channels, files).
     /// `engine`: "apple" or "parakeet".
-    pub fn start(mode: Mode, words: &[String], engine: &str, repaint: impl Fn() + Send + 'static) -> Result<Self, String> {
+    /// `barge_in` (always-listening): keep listening while agents talk, with echo cancellation, so you can
+    /// interrupt them. Off: the microphone is ignored while they talk.
+    pub fn start(mode: Mode, words: &[String], engine: &str, barge_in: bool, repaint: impl Fn() + Send + 'static) -> Result<Self, String> {
         let path = helper_path().ok_or("Voice helper not found. Build the app with scripts/bundle.sh.")?;
         let mut cmd = Command::new(path);
-        cmd.env("YH_ENGINE", engine);
+        cmd.env("YH_ENGINE", engine).env("YH_VP", if barge_in { "1" } else { "0" });
+        BARGE_IN.store(barge_in && mode == Mode::HandsFree, std::sync::atomic::Ordering::Relaxed);
         if mode == Mode::HandsFree {
             cmd.arg("--hands-free");
         }
@@ -159,7 +162,7 @@ impl Dictation {
             .map_err(|e| format!("Couldn't start voice input: {e}"))?;
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let stdout = child.stdout.take().ok_or("no stdout")?;
-        if mode == Mode::HandsFree {
+        if mode == Mode::HandsFree && !barge_in {
             // While the app is talking, the helper ignores the mic: no echo loop.
             let pipe = stdin.clone();
             std::thread::spawn(move || {
@@ -440,12 +443,35 @@ fn words(s: &str) -> Vec<String> {
     s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect()
 }
 
-/// Is this "utterance" really our own voice coming back? True during speech, or when most of its
-/// words are what an agent said in the last minute.
+/// Listening while agents talk (echo cancellation on): see Dictation::start.
+static BARGE_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn barge_in() -> bool {
+    BARGE_IN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Is this "utterance" really our own voice coming back? When most of its words are what an agent said
+/// in the last minute. Without barge-in, anything heard while speaking counts as echo.
 pub fn is_echo(utterance: &str) -> bool {
-    if echo_window() {
+    if !barge_in() && echo_window() {
         return true;
     }
+    sounds_like_us(utterance)
+}
+
+/// You talking over an agent (not its voice leaking through): stop it and listen.
+pub fn interrupts(partial: &str) -> bool {
+    barge_in() && speaking() && is_interruption(partial)
+}
+
+/// Two words or more that aren't the agent's own, or a single "stop"/"wait".
+fn is_interruption(partial: &str) -> bool {
+    let w = words(partial);
+    let stop = w.len() == 1 && ["stop", "wait", "quiet", "hold", "pause", "enough", "shush", "stopp", "halt"].contains(&w[0].as_str());
+    (w.len() >= 2 || stop) && !sounds_like_us(partial)
+}
+
+fn sounds_like_us(utterance: &str) -> bool {
     let heard = words(utterance);
     if heard.len() < 3 {
         return false;
@@ -629,6 +655,11 @@ mod tests {
         // Things you'd actually say are not echoes.
         assert!(!super::is_echo("Write a blog post about voice agents"));
         assert!(!super::is_echo("Yes"));
+        // Talking over an agent: your words interrupt, its own words leaking through don't.
+        assert!(super::is_interruption("wait, actually"));
+        assert!(super::is_interruption("Stop"));
+        assert!(!super::is_interruption("um"));
+        assert!(!super::is_interruption("The only actionable item is adding lid dictation"));
     }
 
     #[test]

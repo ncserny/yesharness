@@ -224,13 +224,19 @@ impl App {
         self.voice_error = None;
         let c = ctx.clone();
         let engine = self.engine();
-        match Dictation::start(mode, &self.vocabulary(), &engine, move || c.request_repaint()) {
+        let barge_in = self.shared.data.lock().unwrap().settings.barge_in;
+        match Dictation::start(mode, &self.vocabulary(), &engine, barge_in, move || c.request_repaint()) {
             Ok(d) => {
                 self.dictation = Some(d);
-                self.voice_engine = engine;
+                self.voice_engine = self.listen_key();
             }
             Err(e) => self.voice_error = Some(e),
         }
+    }
+
+    /// What always-listening was started with; a change restarts it.
+    fn listen_key(&self) -> String {
+        format!("{}:{}", self.engine(), self.shared.data.lock().unwrap().settings.barge_in)
     }
 
     /// The engine to use right now: Parakeet once it's set up, otherwise Apple's.
@@ -309,7 +315,7 @@ impl App {
         };
         // Engine changed (you switched it, or Parakeet just finished setting up): restart listening.
         if let Some(d) = &self.dictation {
-            if d.mode == Mode::HandsFree && self.voice_engine != self.engine() {
+            if d.mode == Mode::HandsFree && self.voice_engine != self.listen_key() {
                 self.dictation = None;
             }
         }
@@ -324,6 +330,11 @@ impl App {
         let mode = d.mode;
         let mut st = d.state.lock().unwrap();
         let mut out = Vec::new();
+
+        // You started talking while an agent speaks: it stops and listens (barge-in).
+        if voice::interrupts(&st.text) || (voice::speaking() && st.utterances.iter().any(|u| voice::interrupts(u))) {
+            voice::stop_speaking();
+        }
 
         // Hands-free: each pause delivers an utterance.
         for u in st.utterances.drain(..) {
@@ -1063,6 +1074,7 @@ fn capsule_text(t: &Theme, voice_state: &Option<(Mode, bool, voice::State)>, han
         Some((_, _, st)) if !st.text.is_empty() => (st.text.clone(), t.strong, 15.0),
         Some((_, true, _)) => ("Sending…".into(), t.secondary, 14.0),
         Some((_, _, st)) if st.info.is_some() => (st.info.clone().unwrap_or_default(), t.secondary, 14.0),
+        _ if voice::speaking() && voice::barge_in() => ("Speaking… · just talk to interrupt".into(), t.secondary, 14.0),
         _ if voice::speaking() => ("Speaking… (not listening meanwhile) · press Space to interrupt".into(), t.secondary, 14.0),
         Some((Mode::HandsFree, _, _)) if run.is_some() => ("Listening. The team is working on it.".into(), t.secondary, 14.0),
         Some((Mode::HandsFree, _, _)) => ("Listening. Just talk.".into(), t.secondary, 14.0),
@@ -1831,6 +1843,11 @@ impl App {
                                     voice::stop_speaking();
                                 }
                             }
+                        });
+                        form_sep(ui, t);
+                        form_row(ui, t, "Interrupt by talking", |ui| {
+                            toggle(ui, t, &mut data.settings.barge_in);
+                            ui.label(RichText::new("Keep listening while agents talk; your voice stops them").size(12.0).color(t.secondary));
                         });
                         form_sep(ui, t);
                         form_row(ui, t, "Speed", |ui| {

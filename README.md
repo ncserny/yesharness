@@ -124,6 +124,9 @@ straight from the folder (no `git` needed), refreshed every minute and after eac
 - **Voice:** always-listening or push-to-talk, read replies, speed, and natural voices. Apple's free
   Premium/Enhanced voices (System Settings → Accessibility → Spoken Content → System voice → Manage Voices…)
   sound far more human. YesHarness picks them up automatically, and the main agent gets the best one.
+- **Interrupt by talking (on by default):** in always-listening mode the app keeps listening while agents talk.
+  Apple's echo cancellation removes their voices from the microphone, so when you speak (or just say "stop"),
+  the agent stops and listens.
 - **ElevenLabs voices (optional):** Settings → Voice → Voices → ElevenLabs, then paste your API key (stored in the
   macOS Keychain, not in YesHarness's files). Pick a voice per agent under Team. Replies are read sentence by
   sentence, so speech starts quickly. If the key is wrong, credits run out or you're offline, the Apple voice

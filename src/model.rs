@@ -224,6 +224,10 @@ pub struct Settings {
     /// Alex's routine turns use one cheap, tool-free call; it switches to its full tools only when needed.
     #[serde(default = "yes")]
     pub quick_routing: bool,
+    /// Always-listening keeps listening while agents talk (echo cancellation removes their voices),
+    /// so you can interrupt them just by talking.
+    #[serde(default = "yes")]
+    pub barge_in: bool,
     /// Reading replies aloud: "apple" (macOS voices) or "elevenlabs" (needs your API key; Apple is the fallback).
     #[serde(default = "apple")]
     pub tts_engine: String,
@@ -261,7 +265,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, tts_engine: apple() }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, tts_engine: apple(), barge_in: true }
     }
 }
 
