@@ -50,9 +50,6 @@ pub struct App {
     team_sel: Option<String>,
     new_channel: Option<NewChannel>,
     renaming: Option<String>,
-    /// ElevenLabs API key being typed in Settings (moved to the Keychain on Save, then cleared).
-    eleven_key: String,
-    eleven_note: Option<String>,
     about: Option<AboutYou>,
     /// The first-run welcome (Alex asks a few questions out loud).
     welcome: Option<crate::welcome::Welcome>,
@@ -196,6 +193,10 @@ impl App {
         heartbeat::start(shared.clone());
         crate::inbox::start(shared.clone());
         crate::memory::start(shared.clone());
+        // Get the natural voice ready, so the first reply doesn't wait for it.
+        if shared.data.lock().unwrap().settings.voice_engine == "local" && std::env::var_os("YH_SCREENSHOT").is_none() {
+            std::thread::spawn(crate::localvoice::start);
+        }
         voice::prepare();
         if shared.data.lock().unwrap().settings.stt_engine == "parakeet" {
             let c = ctx.clone();
@@ -232,8 +233,6 @@ impl App {
             team_sel: None,
             new_channel: None,
             renaming: None,
-            eleven_key: String::new(),
-            eleven_note: None,
             about: None,
             welcome: None,
             panel: None,
@@ -315,7 +314,7 @@ impl App {
         let (alex_color, alex_voice) = {
             let d = self.shared.data.lock().unwrap();
             let idx = d.agents.iter().position(|a| a.handle == "main").unwrap_or(0);
-            d.agents.get(idx).map(|a| (color(a.color), voice::agent_voice(idx, &a.voice, &a.eleven_voice))).unwrap_or((Color32::from_rgb(232, 104, 74), String::new()))
+            d.agents.get(idx).map(|a| (color(a.color), voice::agent_voice(idx, &a.voice, &a.local_voice))).unwrap_or((Color32::from_rgb(232, 104, 74), String::new()))
         };
         let w = self.welcome.as_mut().unwrap();
         for a in answers {
@@ -613,11 +612,7 @@ impl eframe::App for App {
             }
         }
         voice::set_speed(data.settings.speech_speed);
-        voice::set_engine(data.settings.tts_engine == "elevenlabs");
-        if data.settings.tts_engine == "elevenlabs" {
-            let c = ctx.clone();
-            crate::elevenlabs::load_voices(move || c.request_repaint());
-        }
+        voice::set_engine(data.settings.voice_engine == "local");
         if self.applied_theme != data.settings.theme && std::env::var_os("YH_THEME").is_none() {
             self.applied_theme = data.settings.theme.clone();
             ctx.set_theme(match self.applied_theme.as_str() {
@@ -1189,6 +1184,7 @@ impl App {
             orchestrator::stop(&self.shared, &id);
         }
         voice::stop_speaking();
+        crate::localvoice::stop();
         self.dictation = None;
         self.save_if_needed(true);
     }
@@ -1915,8 +1911,6 @@ impl App {
             let mut done = false;
             let mut toggle_listening = false;
             let mut open_about: Option<Option<String>> = None;
-            let eleven_key = &mut self.eleven_key;
-            let eleven_note = &mut self.eleven_note;
             let resp = egui::Modal::new(Id::new("settings")).frame(sheet_frame).backdrop_color(backdrop).show(ctx, |ui| {
                 let mut data = shared.data.lock().unwrap();
                 let before = format!("{:?}", data.settings);
@@ -1999,57 +1993,29 @@ impl App {
                         });
                         form_sep(ui, t);
                         form_row(ui, t, "Voices", |ui| {
-                            let cur = if data.settings.tts_engine == "elevenlabs" { 1 } else { 0 };
-                            if let Some(i) = segmented(ui, t, cur, &["Apple", "ElevenLabs"]) {
-                                data.settings.tts_engine = if i == 1 { "elevenlabs".into() } else { "apple".into() };
-                                voice::set_engine(i == 1);
+                            let cur = if data.settings.voice_engine == "local" { 0 } else { 1 };
+                            if let Some(i) = segmented(ui, t, cur, &["Natural (on this Mac)", "Apple"]) {
+                                data.settings.voice_engine = if i == 0 { "local".into() } else { "apple".into() };
+                                voice::set_engine(i == 0);
                                 voice::stop_speaking();
                             }
-                        });
-                        if data.settings.tts_engine == "elevenlabs" {
-                            use crate::elevenlabs as el;
-                            if el::has_key() {
-                                form_row(ui, t, "API key", |ui| {
-                                    ui.label(RichText::new("Saved in your Keychain").color(t.text));
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.button("Remove").clicked() {
-                                            el::remove_key();
-                                            *eleven_note = None;
-                                        }
-                                        if ui.button("Hear").clicked() {
-                                            voice::stop_speaking();
-                                            voice::speak("Hi, this is how I sound with ElevenLabs.", &voice::agent_voice(0, "", ""));
-                                        }
-                                    });
-                                });
-                                let n = el::cached_voices().len();
-                                let note = match el::problem() {
-                                    Some(p) => format!("{p} Using the Apple voice meanwhile."),
-                                    None if n > 0 => format!("{n} voices on your account. Pick one per agent under Team; each reply read aloud uses ElevenLabs credits."),
-                                    None => "Loading your voices…".into(),
-                                };
-                                ui.add(egui::Label::new(RichText::new(note).size(11.5).color(if el::problem().is_some() { t.red } else { t.secondary })).wrap());
-                            } else {
-                                form_row(ui, t, "API key", |ui| {
-                                    let save = ui.add(egui::TextEdit::singleline(eleven_key).password(true).hint_text("Paste your ElevenLabs API key").desired_width(260.0));
-                                    let enter = save.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    if (ui.button("Save").clicked() || enter) && !eleven_key.trim().is_empty() {
-                                        *eleven_note = Some(match el::save_key(eleven_key) {
-                                            Ok(()) => {
-                                                let c = ctx.clone();
-                                                el::load_voices(move || c.request_repaint());
-                                                String::new()
-                                            }
-                                            Err(e) => e,
-                                        });
-                                        eleven_key.clear();
+                            if data.settings.voice_engine == "local" {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.button("Hear").clicked() {
+                                        voice::stop_speaking();
+                                        voice::speak("Hi, this is how I sound.", &voice::agent_voice(0, "", ""));
                                     }
                                 });
-                                let note = eleven_note.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| {
-                                    "Get a key at elevenlabs.io → Developers → API Keys. It's stored in the macOS Keychain, not in YesHarness's files. Until then, replies use the Apple voice.".into()
-                                });
-                                ui.add(egui::Label::new(RichText::new(note).size(11.5).color(t.secondary)).wrap());
                             }
+                        });
+                        if data.settings.voice_engine == "local" {
+                            let st = crate::localvoice::status();
+                            let note = if st.is_empty() {
+                                "Natural voices that run on your Mac: Kokoro for English, Kyutai Pocket TTS for German, French, Italian and Portuguese. Free, private, no account. Pick a voice per agent under Team.".to_string()
+                            } else {
+                                format!("{st} (English is about 90 MB, downloaded once.)")
+                            };
+                            ui.add(egui::Label::new(RichText::new(note).size(11.5).color(t.secondary)).wrap());
                         }
                         form_sep(ui, t);
                         form_row(ui, t, "Recognition", |ui| {
@@ -2472,26 +2438,26 @@ impl App {
                                 );
                             });
                             form_sep(ui, t);
-                            if voice::uses_elevenlabs() {
-                                form_row(ui, t, "ElevenLabs voice", |ui| {
-                                    use crate::elevenlabs as el;
-                                    let auto = el::auto_voice(idx);
-                                    let auto_label = format!("Automatic ({})", el::voice_name(&auto));
-                                    let current = if a.eleven_voice.is_empty() { auto_label.clone() } else { el::voice_name(&a.eleven_voice) };
-                                    egui::ComboBox::from_id_salt(format!("el-voice-{}", a.id)).selected_text(current).width(230.0).show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut a.eleven_voice, String::new(), auto_label);
-                                        for v in el::cached_voices() {
-                                            ui.selectable_value(&mut a.eleven_voice, v.id.clone(), v.name);
+                            if voice::uses_local() {
+                                form_row(ui, t, "Voice", |ui| {
+                                    use crate::localvoice as lv;
+                                    let auto = lv::auto_voice(idx);
+                                    let auto_label = format!("Automatic ({})", lv::voice_name(auto));
+                                    let current = if a.local_voice.is_empty() { auto_label.clone() } else { lv::voice_name(&a.local_voice) };
+                                    egui::ComboBox::from_id_salt(format!("local-voice-{}", a.id)).selected_text(current).width(230.0).show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut a.local_voice, String::new(), auto_label);
+                                        for (id, name) in lv::VOICES {
+                                            ui.selectable_value(&mut a.local_voice, id.to_string(), name);
                                         }
                                     });
                                     if icon_button(ui, t, Icon::Play, 24.0, false, "Hear it").clicked() {
                                         voice::stop_speaking();
-                                        voice::speak(&format!("Hi, I'm {}.", a.name()), &voice::agent_voice(idx, &a.voice, &a.eleven_voice));
+                                        voice::speak(&format!("Hi, I'm {}.", a.name()), &voice::agent_voice(idx, &a.voice, &a.local_voice));
                                     }
                                 });
                                 form_sep(ui, t);
                             }
-                            form_row(ui, t, if voice::uses_elevenlabs() { "Apple voice" } else { "Voice" }, |ui| {
+                            form_row(ui, t, if voice::uses_local() { "Apple voice" } else { "Voice" }, |ui| {
                                 let auto = voice::auto_voice(idx);
                                 let auto_label = if auto.is_empty() { "System voice".to_string() } else { auto.clone() };
                                 let current = if a.voice.is_empty() { format!("Automatic ({auto_label})") } else { a.voice.clone() };

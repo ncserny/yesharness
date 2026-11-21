@@ -10,6 +10,7 @@
 //   --hands-free    keep listening; after each pause print U:<utterance> and continue
 //   --file <path>   transcribe an audio file (for testing), print F:<text>
 //   --prepare       make sure the speech model is installed, then exit
+//   --speak         read replies aloud with local voices (see Speak.swift)
 //
 // Input lines (stdin): MUTE / UNMUTE: ignore the microphone while the app is speaking (no echo).
 //                       Closing stdin stops listening.
@@ -429,7 +430,12 @@ final class Legacy {
     }
 }
 
-if env["YH_ENGINE"] == "parakeet" {
+if args.contains("--speak") {
+    // Reading replies aloud with local voices (see Speak.swift).
+    let s = Speaker()
+    s.run()
+    withExtendedLifetime(s) { dispatchMain() }
+} else if env["YH_ENGINE"] == "parakeet" {
     // NVIDIA Parakeet Ultra via FluidAudio (see Parakeet.swift).
     let p = Parakeet()
     p.mic.lastLoud = .distantPast

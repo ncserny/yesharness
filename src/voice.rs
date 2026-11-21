@@ -44,6 +44,9 @@ pub fn helper_path() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
     }
+    if let Some(p) = std::env::var_os("YH_HELPER").map(PathBuf::from).filter(|p| p.is_file()) {
+        return Some(p); // tests and development
+    }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     // Inside the .app bundle it sits next to the main binary; during `cargo run` it's in target/release.
@@ -265,34 +268,37 @@ pub fn set_speed(speed: f32) {
     RATE.store(wpm, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Read replies with ElevenLabs instead of Apple's voices (set from Settings every frame).
-static ELEVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Busy with one reply from start to end (also between ElevenLabs pieces, when nothing is playing).
+/// Read replies with the natural voices on this Mac (localvoice.rs) instead of Apple's (set from Settings).
+static LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Busy with one reply from start to end (also between pieces, when nothing is playing).
 static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Bumped by stop_speaking, so a reply being fetched from ElevenLabs stops too.
+/// Bumped by stop_speaking, so a reply being prepared stops too.
 static STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub fn set_engine(elevenlabs: bool) {
-    ELEVEN.store(elevenlabs, std::sync::atomic::Ordering::Relaxed);
+pub fn set_engine(local: bool) {
+    let was = LOCAL.swap(local, std::sync::atomic::Ordering::Relaxed);
+    if local && !was {
+        std::thread::spawn(crate::localvoice::start); // get the voice ready before the next reply
+    }
 }
 
-pub fn uses_elevenlabs() -> bool {
-    ELEVEN.load(std::sync::atomic::Ordering::Relaxed) && crate::elevenlabs::has_key()
+pub fn uses_local() -> bool {
+    LOCAL.load(std::sync::atomic::Ordering::Relaxed) && cfg!(target_os = "macos")
 }
 
-/// The voice to read the n-th agent's replies with: "el:<ElevenLabs id>|<Apple fallback>" or an Apple voice.
-pub fn agent_voice(n: usize, apple: &str, eleven: &str) -> String {
+/// The voice to read the n-th agent's replies with: "nv:<local voice>|<Apple fallback>" or an Apple voice.
+pub fn agent_voice(n: usize, apple: &str, local: &str) -> String {
     let apple = if apple.is_empty() { auto_voice(n) } else { apple.to_string() };
-    if !uses_elevenlabs() {
+    if !uses_local() {
         return apple;
     }
-    let el = if eleven.is_empty() { crate::elevenlabs::auto_voice(n) } else { eleven.to_string() };
-    format!("el:{el}|{apple}")
+    let v = if local.is_empty() { crate::localvoice::auto_voice(n).to_string() } else { local.to_string() };
+    format!("nv:{v}|{apple}")
 }
 
-/// "el:<id>|<apple>" -> (Some(id), apple); an Apple voice -> (None, voice).
+/// "nv:<id>|<apple>" -> (Some(id), apple); an Apple voice -> (None, voice).
 fn parse_voice(v: &str) -> (Option<&str>, &str) {
-    match v.strip_prefix("el:") {
+    match v.strip_prefix("nv:") {
         Some(rest) => {
             let (id, apple) = rest.split_once('|').unwrap_or((rest, ""));
             (Some(id).filter(|i| !i.is_empty()), apple)
@@ -328,9 +334,9 @@ pub fn speak(text: &str, voice: &str) {
                 std::thread::sleep(std::time::Duration::from_millis(60));
                 continue;
             };
-            let (eleven, apple) = parse_voice(&voice);
-            let done = match eleven {
-                Some(id) if uses_elevenlabs() => speak_elevenlabs(&text, id, apple),
+            let (local, apple) = parse_voice(&voice);
+            let done = match local {
+                Some(id) if uses_local() => speak_local(&text, id, apple),
                 _ => false,
             };
             if !done {
@@ -370,12 +376,12 @@ fn say(text: &str, voice: &str) {
     play(cmd);
 }
 
-/// Reads `text` with ElevenLabs: fetches the next piece while the current one plays.
+/// Reads `text` with the local voice: prepares the next piece while the current one plays.
 /// Returns false if nothing could be played (then the Apple voice reads it instead).
-fn speak_elevenlabs(text: &str, voice: &str, apple: &str) -> bool {
+fn speak_local(text: &str, voice: &str, apple: &str) -> bool {
     let stops = STOPS.load(std::sync::atomic::Ordering::SeqCst);
     let speed = RATE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 200.0;
-    let pieces = crate::elevenlabs::pieces(text);
+    let pieces = crate::localvoice::pieces(text);
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<PathBuf, String>>(2);
     let voice_id = voice.to_string();
     let fetch_pieces = pieces.clone();
@@ -384,10 +390,8 @@ fn speak_elevenlabs(text: &str, voice: &str, apple: &str) -> bool {
             if STOPS.load(std::sync::atomic::Ordering::SeqCst) != stops {
                 return;
             }
-            let r = crate::elevenlabs::synthesize(p, &voice_id, speed).and_then(|audio| {
-                let f = std::env::temp_dir().join(format!("yh-tts-{}-{i}.mp3", crate::model::new_id()));
-                std::fs::write(&f, audio).map(|_| f).map_err(|e| e.to_string())
-            });
+            let _ = i;
+            let r = crate::localvoice::synthesize(p, &voice_id, speed);
             let failed = r.is_err();
             if tx.send(r).is_err() || failed {
                 return;
