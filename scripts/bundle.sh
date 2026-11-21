@@ -4,7 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # The version comes from the git tags (v1.5.0 …): YH_VERSION, else the latest tag, else what's in Cargo.toml.
-VERSION="${YH_VERSION:-$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null | sed 's/^v//')}"
+# (No tags, e.g. a shallow CI checkout: keep the version in Cargo.toml.)
+VERSION="${YH_VERSION:-$( (git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true) | sed 's/^v//')}"
 if [ -n "$VERSION" ]; then
   echo "› Version $VERSION"
   BACKUP=$(mktemp -d)
