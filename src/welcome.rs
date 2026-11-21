@@ -371,7 +371,7 @@ fn norm(s: &str) -> String {
     s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
-/// Folders you named (spoken loosely: "nader io" for nader-io), and other names you said.
+/// Folders you named (spoken loosely: "sample site" for sample-site), and other names you said.
 pub fn match_projects(text: &str, folders: &[String]) -> (Vec<String>, Vec<String>) {
     let spoken = norm(text);
     let mut found: Vec<String> = folders.iter().filter(|f| norm(f).len() >= 3 && spoken.contains(&norm(f))).cloned().collect();
