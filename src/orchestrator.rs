@@ -764,7 +764,15 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         t.tokens > TOKEN_BUDGET
     };
     // An agent that tried something and was blocked isn't making empty promises: it already says why.
-    let idle_claim = !out.error && !out.receipt.did_work() && out.receipt.blocked == 0 && delegates.is_empty() && actions.is_empty() && claims_work(&shown, &members);
+    // Nor is one that looked things up and answered, or that asks you for something ("send me the link and I'll…").
+    let idle_claim = !out.error
+        && !out.receipt.did_work()
+        && out.receipt.blocked == 0
+        && out.receipt.lookups == 0
+        && delegates.is_empty()
+        && actions.is_empty()
+        && !asks_user(&shown)
+        && claims_work(&shown, &members);
 
     let to_user = matches!(mode, Mode::User | Mode::FollowUp | Mode::Nudge) && !out.error;
     if matches!(mode, Mode::User) && !out.error {
@@ -888,6 +896,10 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
         let seen = ch.seen.get(&me.id).copied().unwrap_or(0).min(ch.messages.len());
         start = seen.max(ch.messages.len().saturating_sub(HISTORY));
         p.push_str(&format!("## New messages in #{} since your last turn\n\n", ch.name));
+        p.push_str(&format!(
+            "(You can read the user's other projects in {}. If they name one you can't place, look there and ask.)\n\n",
+            model::projects_dir().replacen(&model::home_dir(), "~", 1)
+        ));
     } else {
         p.push_str(&preamble(ch, me, members, shared));
         start = ch.messages.len().saturating_sub(HISTORY);
@@ -1014,9 +1026,13 @@ fn memory_recall(shared: &Shared, cid: &str) -> (String, String) {
 /// Adds the memory note (at the start of a conversation) and recalled messages, just before "## Your turn".
 fn with_memory(mut prompt: String, cid: &str, fresh: bool, recall: &str, shared: &Shared) -> String {
     if !shared.data.lock().unwrap().settings.memory {
+        // What you told the app about yourself is used even with memory off.
+        if fresh {
+            insert_memory(&mut prompt, &crate::memory::you_section());
+        }
         return prompt;
     }
-    let mut extra = if fresh { crate::memory::note_section(cid) } else { String::new() };
+    let mut extra = if fresh { format!("{}{}", crate::memory::you_section(), crate::memory::note_section(cid)) } else { String::new() };
     extra.push_str(recall);
     insert_memory(&mut prompt, &extra);
     prompt
@@ -1145,7 +1161,7 @@ fn preamble(ch: &Channel, me: &Agent, members: &[Agent], shared: &Shared) -> Str
          Use your tools to actually do the work in the project folder. Reply in a concise chat style \
          (Markdown is fine). The user mostly speaks instead of typing, so their messages are voice transcripts \
          that may contain mistakes (e.g. \"docks\" for \"docs\"); interpret them sensibly and don't ask \
-         about obvious slips. Names get mangled most (\"Kunstarder\" for \"Kunsthalle\"): when the user names a \
+         about obvious slips. Names get mangled most (\"Moon pace\" for \"Moonbase\"): when the user names a \
          project, look for it (their projects are folders in {projects}, which you can read; also their GitHub) \
          and if nothing clearly matches, say what you found and ask which one they mean instead of guessing.\n",
         projects = model::projects_dir().replacen(&model::home_dir(), "~", 1)
@@ -1372,6 +1388,16 @@ pub fn claims_work(text: &str, members: &[Agent]) -> bool {
     members.iter().any(|m| t.contains(&format!("@{}", m.handle.to_lowercase())))
 }
 
+/// The reply asks you for something (a question, a link, a choice): it's waiting on you, not promising work.
+pub fn asks_user(text: &str) -> bool {
+    let t = text.to_lowercase().replace('’', "'");
+    const ASKS: [&str; 12] = [
+        "send me", "tell me", "give me", "let me know", "could you", "can you", "would you", "which one", "do you want",
+        "should i", "please share", "please send",
+    ];
+    t.contains('?') || ASKS.iter().any(|a| t.contains(a))
+}
+
 /// What really happened recently in this channel, for the main agent's prompt.
 fn facts(ch: &Channel, me: &Agent, data: &Data, shared: &Shared) -> String {
     let working: Vec<String> = shared
@@ -1556,6 +1582,9 @@ mod tests {
         // Facts about the world aren't promises (the reply from the Turin screenshot).
         assert!(!claims_work("In past years the two semis have started around early afternoon, Turin time.", &m));
         assert!(claims_work("The developer is working on it now.", &m));
+        // Waiting on the user, not an empty promise (a real reply).
+        assert!(asks_user("Send me a link, or give the agents access to its folder, and I'll review it."));
+        assert!(!asks_user("On it, I'll start right away."));
         assert!(!claims_work("Sure, let me know which file.", &m));
     }
 
@@ -1609,17 +1638,17 @@ mod tests {
     /// The lead is still busy when you send something else: a General helper takes it instead of making you wait.
     #[test]
     fn follow_up_restarts_the_lead_with_both_messages() {
-        // "Look up Kunstarder" … "Kunst Halle." The lead starts over and answers both together; no helper answers
+        // "Look up Moon pace" … "Moonbase." The lead starts over and answers both together; no helper answers
         // the correction on its own.
-        let lead = agent("L", "main", &fake(&[("Kunst Halle", "Found Kunsthalle"), ("", "sleep=4;answered the first only")]));
+        let lead = agent("L", "main", &fake(&[("Moonbase.", "Found Moonbase"), ("", "sleep=4;answered the first only")]));
         let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
-        send(&shared, "c", "Can you look up Kunstarder, my project?".into());
+        send(&shared, "c", "Can you look up Moon pace, my project?".into());
         std::thread::sleep(std::time::Duration::from_millis(800));
-        send(&shared, "c", "Kunst Halle.".into());
+        send(&shared, "c", "Moonbase.".into());
         let msgs = wait(&shared);
         assert!(msgs.iter().any(|(_, m)| m.contains("starting over with both")), "{msgs:#?}");
-        assert!(msgs.iter().any(|(_, m)| m == "Found Kunsthalle"), "{msgs:#?}");
+        assert!(msgs.iter().any(|(_, m)| m == "Found Moonbase"), "{msgs:#?}");
         assert!(!msgs.iter().any(|(_, m)| m.contains("first only") || m.contains("General")), "{msgs:#?}");
         assert!(!msgs.iter().any(|(_, m)| m.contains("(stopped)")), "the stopped turn stays silent: {msgs:#?}");
     }

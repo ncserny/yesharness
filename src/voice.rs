@@ -145,9 +145,13 @@ impl Dictation {
     /// `engine`: "apple" or "parakeet".
     /// `barge_in` (always-listening): keep listening while agents talk, with echo cancellation, so you can
     /// interrupt them. Off: the microphone is ignored while they talk.
-    pub fn start(mode: Mode, words: &[String], engine: &str, barge_in: bool, repaint: impl Fn() + Send + 'static) -> Result<Self, String> {
+    /// `langs`: languages you speak ("en,de"); recognition sticks to these ("" = your Mac's languages).
+    pub fn start(mode: Mode, words: &[String], engine: &str, barge_in: bool, langs: &str, repaint: impl Fn() + Send + 'static) -> Result<Self, String> {
         let path = helper_path().ok_or("Voice helper not found. Build the app with scripts/bundle.sh.")?;
         let mut cmd = Command::new(path);
+        if !langs.is_empty() {
+            cmd.env("YH_LANGS", langs);
+        }
         cmd.env("YH_ENGINE", engine).env("YH_VP", if barge_in { "1" } else { "0" });
         BARGE_IN.store(barge_in && mode == Mode::HandsFree, std::sync::atomic::Ordering::Relaxed);
         if mode == Mode::HandsFree {

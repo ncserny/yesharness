@@ -124,6 +124,8 @@ straight from the folder (no `git` needed), refreshed every minute and after eac
 - **Voice:** always-listening or push-to-talk, read replies, speed, and natural voices. Apple's free
   Premium/Enhanced voices (System Settings → Accessibility → Spoken Content → System voice → Manage Voices…)
   sound far more human. YesHarness picks them up automatically, and the main agent gets the best one.
+- **Your languages:** Parakeet guesses the language of each sentence; if it comes out in a language you don't
+  speak (set in About you), the sentence is transcribed again with Apple's recognizer in your language.
 - **Interrupt by talking (on by default):** in always-listening mode the app keeps listening while agents talk.
   Apple's echo cancellation removes their voices from the microphone, so when you speak (or just say "stop"),
   the agent stops and listens.
@@ -131,6 +133,11 @@ straight from the folder (no `git` needed), refreshed every minute and after eac
   macOS Keychain, not in YesHarness's files). Pick a voice per agent under Team. Replies are read sentence by
   sentence, so speech starts quickly. If the key is wrong, credits run out or you're offline, the Apple voice
   takes over. Each reply read aloud uses your ElevenLabs credits (replies are capped at 1,500 characters).
+
+### About you
+The first time you start the app it asks a few questions: your name, what you do, the languages you speak, how
+you like answers, and your projects (it suggests the folders you worked on lately). Every agent reads this, so
+"look at my project X" works. Edit it any time in Settings → You → About you.
 
 ### Memory
 Each channel has a long-term memory, in the style of [Letta](https://github.com/letta-ai/letta), with no extra

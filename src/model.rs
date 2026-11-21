@@ -224,6 +224,12 @@ pub struct Settings {
     /// Alex's routine turns use one cheap, tool-free call; it switches to its full tools only when needed.
     #[serde(default = "yes")]
     pub quick_routing: bool,
+    /// The first-run questions were answered (or skipped).
+    #[serde(default)]
+    pub onboarded: bool,
+    /// Languages you speak (ISO codes, e.g. "en", "de"): speech recognition sticks to these.
+    #[serde(default)]
+    pub languages: Vec<String>,
     /// Always-listening keeps listening while agents talk (echo cancellation removes their voices),
     /// so you can interrupt them just by talking.
     #[serde(default = "yes")]
@@ -265,7 +271,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, tts_engine: apple(), barge_in: true }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, tts_engine: apple(), barge_in: true, onboarded: false, languages: Vec::new() }
     }
 }
 
