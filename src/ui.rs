@@ -145,6 +145,7 @@ impl App {
         );
         heartbeat::start(shared.clone());
         crate::inbox::start(shared.clone());
+        crate::memory::start(shared.clone());
         voice::prepare();
         if shared.data.lock().unwrap().settings.stt_engine == "parakeet" {
             let c = ctx.clone();
@@ -795,6 +796,7 @@ impl eframe::App for App {
             .frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 0)))
             .show(ctx, |ui| {
                 window_drag(ui, ui.max_rect(), "header-drag");
+                let memory_on = data.settings.memory;
                 let Data { agents, channels, selected, .. } = &mut *data;
                 let Some(idx) = channels.iter().position(|c| c.id == cid) else { return };
                 let mut delete = false;
@@ -825,7 +827,7 @@ impl eframe::App for App {
                     }
                     });
                     ui.add_space(1.0);
-                    project_chips(ui, &t, &project, &ch.folder, &cid, &mut actions);
+                    project_chips(ui, &t, &project, &ch.folder, &cid, memory_on, &mut actions);
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1516,7 +1518,7 @@ fn open_path(p: &std::path::Path) {
 }
 
 /// Git/GitHub, AGENTS.md, TASKS.md and docs at a glance. Missing pieces are one click away.
-fn project_chips(ui: &mut egui::Ui, t: &Theme, p: &crate::project::ProjectInfo, folder: &str, cid: &str, actions: &mut Vec<Action>) {
+fn project_chips(ui: &mut egui::Ui, t: &Theme, p: &crate::project::ProjectInfo, folder: &str, cid: &str, memory_on: bool, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         let good = (t.text, t.control);
@@ -1595,7 +1597,43 @@ fn project_chips(ui: &mut egui::Ui, t: &Theme, p: &crate::project::ProjectInfo, 
         } else {
             chip(ui, "No docs", dim.0, dim.1, "No docs/ folder yet.");
         }
+        if memory_on {
+            memory_chip(ui, t, cid, actions);
+        }
     });
+}
+
+/// Long-term memory: setup progress, or the channel's note (click to read it).
+fn memory_chip(ui: &mut egui::Ui, t: &Theme, cid: &str, actions: &mut Vec<Action>) {
+    use crate::memory::{self, Status};
+    let good = (t.text, t.control);
+    let dim = (t.tertiary, t.control.gamma_multiply(0.6));
+    let warn = (t.amber, t.amber.gamma_multiply(0.14));
+    let has_note = memory::read_blocks(cid).is_some();
+    let open = |actions: &mut Vec<Action>| actions.push(Action::ShowFile(memory::blocks_path(cid)));
+    match memory::status() {
+        Status::Downloading(pct) => {
+            chip(ui, &format!("Memory: downloading bge-m3 {pct}%"), warn.0, warn.1, "Downloading the search model for memory through Ollama (~1.2 GB, once).");
+        }
+        Status::Failed(e) => {
+            chip(ui, "Memory search off", warn.0, warn.1, &format!("Couldn't download bge-m3: {e}. Retrying in a few minutes."));
+        }
+        Status::NoOllama => {
+            let tip = "Memory search needs Ollama (ollama.com). Notes still work once a local model is installed.";
+            if chip(ui, if has_note { "Memory" } else { "No memory search" }, dim.0, dim.1, tip).clicked() && has_note {
+                open(actions);
+            }
+        }
+        Status::Starting | Status::Ready => {
+            if has_note {
+                if chip(ui, "Memory", good.0, good.1, "What the team remembers about you and this project. Click to read; edit the file to correct it.").clicked() {
+                    open(actions);
+                }
+            } else {
+                chip(ui, "Memory: empty", dim.0, dim.1, "The team starts remembering after your first conversations here.");
+            }
+        }
+    }
 }
 
 const ASK_AGENTS_MD: &str = "Please write an AGENTS.md for this project: what it is, how it's organized, how to run, build and \
@@ -1760,6 +1798,10 @@ impl App {
                         form_row(ui, t, "Quick routing", |ui| {
                             toggle(ui, t, &mut data.settings.quick_routing);
                             ui.label(RichText::new("Alex answers and delegates in one cheap call; uses full tools only when needed").size(12.0).color(t.secondary));
+                        });
+                        form_row(ui, t, "Memory", |ui| {
+                            toggle(ui, t, &mut data.settings.memory);
+                            ui.label(RichText::new("Remembers you and each project between conversations, on this Mac (Ollama + bge-m3)").size(12.0).color(t.secondary));
                         });
                     });
                     group(ui, t, "Voice", |ui| {

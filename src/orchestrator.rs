@@ -31,6 +31,8 @@ const MAX_DEPTH: u32 = 2;
 /// How many messages a fresh agent (no session yet) gets as context.
 const HISTORY: usize = 30;
 const MAX_MSG_CHARS: usize = 8000;
+/// How many recent messages the router-mode prompt shows.
+const ROUTER_HISTORY: usize = 12;
 
 pub struct Run {
     pub cancel: Arc<AtomicBool>,
@@ -548,9 +550,14 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
     };
     let status = |s: String| shared.set_status(cid, &agent.handle, s);
     let ctl = Ctl { cancel: &cancel, pid: &pid, status: &status };
+    // Long-term memory: the channel's note (new conversations) and older messages related to this request.
+    let (recall, router_recall) = memory_recall(shared, cid);
     let prompt_for = |fresh: bool| {
-        let data = shared.data.lock().unwrap();
-        data.channel(cid).map(|ch| build_prompt(ch, &agent, &members, &data, &mode, fresh, read_aloud, shared)).unwrap_or_default()
+        let p = {
+            let data = shared.data.lock().unwrap();
+            data.channel(cid).map(|ch| build_prompt(ch, &agent, &members, &data, &mode, fresh, read_aloud, shared)).unwrap_or_default()
+        };
+        with_memory(p, cid, fresh, &recall, shared)
     };
 
     // Images on your latest message go to the agent answering you.
@@ -573,6 +580,7 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
             let data = shared.data.lock().unwrap();
             data.channel(cid).map(|ch| build_router_prompt(ch, &agent, &members, &data, &mode, read_aloud, shared)).unwrap_or_default()
         };
+        let prompt = with_memory(prompt, cid, true, &router_recall, shared);
         let model = probe::pick_model(&eff, shared.health_of(&eff).as_ref());
         shared.set_status(cid, &agent.handle, "thinking…".into());
         let r = agents::run_router(&folder, &prompt, model.as_deref(), &ctl);
@@ -894,6 +902,54 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
     p
 }
 
+/// Older messages related to the latest request, for a full prompt (beyond its HISTORY window) and a router
+/// prompt (beyond its last 12 messages). Empty when memory is off or not set up.
+fn memory_recall(shared: &Shared, cid: &str) -> (String, String) {
+    let (query, full_ts, router_ts) = {
+        let data = shared.data.lock().unwrap();
+        if !data.settings.memory {
+            return (String::new(), String::new());
+        }
+        let Some(ch) = data.channel(cid) else { return (String::new(), String::new()) };
+        let query = ch
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.author, Author::User | Author::Agent(_)) && !m.error)
+            .map(|m| m.text.chars().take(2000).collect::<String>())
+            .unwrap_or_default();
+        let ts_at = |n: usize| ch.messages.get(ch.messages.len().saturating_sub(n)).map(|m| m.ts).unwrap_or(0);
+        (query, ts_at(HISTORY), ts_at(ROUTER_HISTORY))
+    };
+    let mut r = crate::memory::recall_sections(cid, &query, &[full_ts, router_ts]).into_iter();
+    (r.next().unwrap_or_default(), r.next().unwrap_or_default())
+}
+
+/// Adds the memory note (at the start of a conversation) and recalled messages, just before "## Your turn".
+fn with_memory(mut prompt: String, cid: &str, fresh: bool, recall: &str, shared: &Shared) -> String {
+    if !shared.data.lock().unwrap().settings.memory {
+        return prompt;
+    }
+    let mut extra = if fresh { crate::memory::note_section(cid) } else { String::new() };
+    extra.push_str(recall);
+    insert_memory(&mut prompt, &extra);
+    prompt
+}
+
+fn insert_memory(prompt: &mut String, extra: &str) {
+    if extra.trim().is_empty() {
+        return;
+    }
+    let block = format!("{}\n\n", extra.trim());
+    match prompt.rfind("## Your turn") {
+        Some(i) => prompt.insert_str(i, &block),
+        None => {
+            prompt.push_str("\n\n");
+            prompt.push_str(&block);
+        }
+    }
+}
+
 /// Router-mode prompt: briefing, team, facts and the recent conversation, kept small (one call, no tools).
 #[allow(clippy::too_many_arguments)]
 fn build_router_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: &Mode, read_aloud: bool, shared: &Shared) -> String {
@@ -915,7 +971,7 @@ fn build_router_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data,
     }
     p.push_str(&facts(ch, me, data, shared));
     p.push_str("\n## Recent conversation\n");
-    let start = ch.messages.len().saturating_sub(12);
+    let start = ch.messages.len().saturating_sub(ROUTER_HISTORY);
     for m in &ch.messages[start..] {
         let who = match &m.author {
             Author::User => "User".to_string(),
@@ -1662,5 +1718,15 @@ mod tests {
         let msgs = wait(&shared);
         assert!(msgs.iter().any(|(_, t)| t.contains("lead is usage limit reached") || t.contains("so backup is taking this")), "{msgs:#?}");
         assert_eq!(msgs.last().unwrap().1, "backup here");
+    }
+
+    #[test]
+    fn memory_goes_before_your_turn() {
+        let mut p = "## Conversation so far\n\n**User:** hi\n\n## Your turn\nRespond.".to_string();
+        insert_memory(&mut p, "\n## Long-term memory\n- Likes short answers\n");
+        assert_eq!(p, "## Conversation so far\n\n**User:** hi\n\n## Long-term memory\n- Likes short answers\n\n## Your turn\nRespond.");
+        let before = p.clone();
+        insert_memory(&mut p, "  \n");
+        assert_eq!(p, before, "nothing to add");
     }
 }
