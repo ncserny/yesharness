@@ -90,7 +90,7 @@ impl Shared {
 
     pub fn post(&self, cid: &str, author: Author, text: String, error: bool) {
         if let Some(ch) = self.data.lock().unwrap().channel_mut(cid) {
-            ch.messages.push(Message { author, text, ts: model::now(), error, to_user: false, via: String::new() });
+            ch.messages.push(Message { author, text, ts: model::now(), error, to_user: false, via: String::new(), attachments: Vec::new() });
         }
         self.dirty.store(true, Ordering::Relaxed);
         (self.repaint)();
@@ -161,7 +161,16 @@ impl Shared {
 
 /// Called by the UI when you hit send (or stop talking).
 pub fn send(shared: &Arc<Shared>, cid: &str, text: String) {
-    shared.post(cid, Author::User, text.clone(), false);
+    send_with(shared, cid, text, Vec::new());
+}
+
+/// Send with images attached (absolute paths inside the project folder).
+pub fn send_with(shared: &Arc<Shared>, cid: &str, text: String, attachments: Vec<String>) {
+    if let Some(ch) = shared.data.lock().unwrap().channel_mut(cid) {
+        ch.messages.push(Message { author: Author::User, text: text.clone(), ts: model::now(), error: false, to_user: false, via: String::new(), attachments });
+    }
+    shared.dirty.store(true, Ordering::Relaxed);
+    (shared.repaint)();
     let mut runs = shared.runs.lock().unwrap();
     if let Some(run) = runs.get_mut(cid) {
         // Agents are busy in this channel: handle it right after.
@@ -413,6 +422,16 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
         data.channel(cid).map(|ch| build_prompt(ch, &agent, &members, &data, &mode, fresh, read_aloud, shared)).unwrap_or_default()
     };
 
+    // Images on your latest message go to the agent answering you.
+    let images: Vec<String> = if matches!(mode, Mode::User) {
+        let data = shared.data.lock().unwrap();
+        data.channel(cid)
+            .and_then(|ch| ch.messages.iter().rev().find(|m| m.author == Author::User))
+            .map(|m| m.attachments.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut session = if eff.kind.supports_sessions() { sessions.get(&session_key(&eff)).cloned() } else { None };
     let mut out;
     let mut used_model;
@@ -423,7 +442,7 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
         let label = used_model.clone().unwrap_or_else(|| "default model".into());
         shared.set_status(cid, &agent.handle, format!("thinking… ({} · {label})", eff.kind.label()));
         // `eff` carries the role's identity (handle, briefing) with the engine that's actually available.
-        out = agents::run(&eff, &folder, &prompt_for(session.is_none()), session.as_deref(), used_model.as_deref(), &ctl);
+        out = agents::run(&eff, &folder, &prompt_for(session.is_none()), session.as_deref(), used_model.as_deref(), &images, &ctl);
         if let Some(info) = &out.rate {
             let mut health = shared.health.lock().unwrap();
             probe::apply_claude_rate_info(info, health.entry(probe::key(&eff)).or_insert_with(|| Health { installed: true, ..Default::default() }));
@@ -503,6 +522,7 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
                 error: out.error,
                 to_user,
                 via,
+                attachments: Vec::new(),
             });
             ch.seen.insert(agent.id.clone(), ch.messages.len());
             if !selected {
@@ -592,7 +612,16 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
         } else {
             m.text.clone()
         };
-        p.push_str(&format!("**{who}:** {text}\n\n"));
+        p.push_str(&format!("**{who}:** {text}\n"));
+        if !m.attachments.is_empty() {
+            p.push_str(&format!(
+                "(Attached image{}: {}. Open {} to see what the user means.)\n",
+                if m.attachments.len() == 1 { "" } else { "s" },
+                m.attachments.join(", "),
+                if m.attachments.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        p.push('\n');
     }
     let name = |id: &str| data.agent(id).map(|a| a.handle.clone()).unwrap_or_else(|| "agent".into());
     p.push_str("## Your turn\n");
@@ -610,8 +639,8 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
     });
     if read_aloud && !matches!(mode, Mode::Delegated { .. }) {
         p.push_str(
-            "\n(Your reply is read aloud to the user. Start with one or two plain spoken sentences that \
-             answer or summarize; put details, code and lists after that.)",
+            "\n(Your reply is read aloud to the user. Keep it short: one or two plain spoken sentences that \
+             answer or summarize. Add details, code or lists only if the user asked for them.)",
         );
     }
     // The main agent can run the app itself. Repeated every turn so it also reaches ongoing sessions.

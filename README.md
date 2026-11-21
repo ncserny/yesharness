@@ -74,6 +74,9 @@ hands it out to the specialists, then tells you how it went.
     through [FluidAudio](https://github.com/FluidInference/FluidAudio). One-time setup of about 0.7 GB. Apple stays
     in use until it's ready. In a five-clip test it made half as many mistakes as Apple's recognizer (2.2% vs 4.5%
     words wrong), at a similar speed (~0.5 s per sentence). Live text comes from re-transcribing about every 0.6 s.
+- **Images:** drag an image onto the window and it goes with your next message, typed or spoken. It's copied to
+  `<project>/.yesharness/attachments/`, which is excluded from Git. Codex receives it as an image input, and the
+  other engines are pointed at the file.
 - The ⌨ button shows a text box if you do want to type.
 
 ### Agents pick themselves

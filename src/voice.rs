@@ -448,6 +448,9 @@ pub fn auto_voice(n: usize) -> String {
     }
 }
 
+/// Read whole replies (skipping code), up to about a minute of speech, ending on a full sentence.
+const SPEAK_MAX: usize = 1500;
+
 /// The first couple of sentences, without code, handoff lines or Markdown symbols.
 pub fn speakable(text: &str) -> String {
     let mut out = String::new();
@@ -481,15 +484,15 @@ pub fn speakable(text: &str) -> String {
         }
         out.push_str(clean.trim());
         out.push(' ');
-        if out.len() > 320 {
+        if out.len() > SPEAK_MAX {
             break;
         }
     }
     let out = out.trim();
-    if out.len() <= 320 {
+    if out.len() <= SPEAK_MAX {
         return out.to_string();
     }
-    let mut end = 320;
+    let mut end = SPEAK_MAX;
     while !out.is_char_boundary(end) {
         end -= 1;
     }

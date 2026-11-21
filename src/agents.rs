@@ -26,11 +26,12 @@ pub struct Ctl<'a> {
 }
 
 /// `model`: what to pass to the CLI (None = its own default). See probe::pick_model.
-pub fn run(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, model: Option<&str>, ctl: &Ctl) -> Outcome {
+/// `images`: pictures attached to the message (Codex gets them as image inputs; everyone gets the paths in the prompt).
+pub fn run(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, model: Option<&str>, images: &[String], ctl: &Ctl) -> Outcome {
     let mut out = match agent.kind {
         AgentKind::Claude => run_claude(agent, folder, prompt, session, model, ctl),
-        AgentKind::Codex => run_codex(agent, folder, prompt, session, model, false, ctl),
-        AgentKind::Local => run_codex(agent, folder, prompt, session, model, true, ctl),
+        AgentKind::Codex => run_codex(agent, folder, prompt, session, model, false, images, ctl),
+        AgentKind::Local => run_codex(agent, folder, prompt, session, model, true, &[], ctl),
         AgentKind::Custom => run_custom(agent, folder, prompt, ctl),
     };
     if out.error {
@@ -151,7 +152,8 @@ fn describe_tool(name: &str, input: &Value) -> String {
 // ---------------------------------------------------------------- Codex
 
 /// `local`: run Codex against a model on this Mac (Ollama) instead of OpenAI's servers.
-fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, model: Option<&str>, local: bool, ctl: &Ctl) -> Outcome {
+#[allow(clippy::too_many_arguments)]
+fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, model: Option<&str>, local: bool, images: &[String], ctl: &Ctl) -> Outcome {
     let mut cmd = env::command("codex");
     cmd.current_dir(folder).arg("exec");
     if session.is_some() {
@@ -167,6 +169,9 @@ fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, 
     }
     if !agent.effort.is_empty() {
         cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", agent.effort)]);
+    }
+    for img in images.iter().filter(|p| Path::new(p).is_file()) {
+        cmd.args(["-i", img]);
     }
     if agent.full_access {
         cmd.arg("--dangerously-bypass-approvals-and-sandbox");

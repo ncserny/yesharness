@@ -100,7 +100,7 @@ fn beat(shared: &Arc<Shared>, mem: &mut HashMap<String, Snapshot>) {
             continue;
         }
         let text = describe(&changes, &who, first_look);
-        ch.messages.push(Message { author: Author::Heartbeat, text, ts: now(), error: false, to_user: false, via: String::new() });
+        ch.messages.push(Message { author: Author::Heartbeat, text, ts: now(), error: false, to_user: false, via: String::new(), attachments: Vec::new() });
         let name = ch.name.clone();
         if selected.as_deref() != Some(cid.as_str()) {
             ch.unread = true;

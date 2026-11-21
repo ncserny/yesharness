@@ -33,6 +33,8 @@ pub struct App {
     pressed_at: Option<Instant>,
     mic_was_down: bool,
     voice_error: Option<String>,
+    /// Images dropped onto the window, waiting to go with your next message.
+    attachments: Vec<std::path::PathBuf>,
     /// Which speech engine the running dictation uses.
     voice_engine: String,
     /// Channel whose full history is shown (others show the latest messages only).
@@ -132,6 +134,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let ctx = cc.egui_ctx.clone();
         crate::theme::install(&ctx);
+        egui_extras::install_image_loaders(&ctx);
         let data = model::load();
         let repaint_ctx = ctx.clone();
         let shared = Shared::new(
@@ -167,6 +170,7 @@ impl App {
             pressed_at: None,
             mic_was_down: false,
             voice_error: None,
+            attachments: Vec::new(),
             voice_engine: String::new(),
             show_all: None,
             live: None,
@@ -411,6 +415,27 @@ impl eframe::App for App {
         if self.panel.is_some() && ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.panel = None;
         }
+        // Images dragged onto the window: attach to the next message.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for p in dropped {
+            if is_image(&p) {
+                if !self.attachments.contains(&p) {
+                    self.attachments.push(p);
+                }
+            } else {
+                self.voice_error = Some(format!("Only images can be attached for now ({}).", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+            }
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let t = Theme::of(ctx);
+            let screen = ctx.screen_rect();
+            let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("drop-overlay")));
+            p.rect_filled(screen, 0.0, Color32::from_black_alpha(if t.dark { 120 } else { 60 }));
+            let card = Rect::from_center_size(screen.center(), vec2(280.0, 110.0));
+            p.rect(card, 16.0, t.bg, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+            p.text(card.center() - vec2(0.0, 12.0), Align2::CENTER_CENTER, "Drop to attach", FontId::proportional(17.0), t.strong);
+            p.text(card.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, "Goes with your next message", FontId::proportional(12.5), t.secondary);
+        }
         let to_send = self.poll_voice(ctx);
         let voice_state = self.dictation.as_ref().map(|d| (d.mode, d.stopping(), d.state.lock().unwrap().clone()));
         let shared = self.shared.clone();
@@ -600,6 +625,29 @@ impl eframe::App for App {
             .show_separator_line(false)
             .frame(Frame::new().fill(t.bg).inner_margin(Margin { left: 16, right: 16, top: 4, bottom: 10 }))
             .show(ctx, |ui| {
+                if !self.attachments.is_empty() {
+                    let mut remove = None;
+                    ui.horizontal(|ui| {
+                        let w = self.attachments.len() as f32 * 64.0 + 120.0;
+                        ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
+                        for (i, p) in self.attachments.iter().enumerate() {
+                            let img = egui::Image::new(format!("file://{}", p.display()))
+                                .fit_to_exact_size(vec2(52.0, 52.0))
+                                .maintain_aspect_ratio(true)
+                                .corner_radius(8);
+                            let r = ui.add(img.sense(Sense::click())).on_hover_text(format!("{} (click to remove)", p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+                            if r.clicked() {
+                                remove = Some(i);
+                            }
+                        }
+                        let n = self.attachments.len();
+                        ui.label(RichText::new(if n == 1 { "1 image attached".to_string() } else { format!("{n} images attached") }).size(11.5).color(t.secondary));
+                    });
+                    if let Some(i) = remove {
+                        self.attachments.remove(i);
+                    }
+                    ui.add_space(6.0);
+                }
                 if let Some(e) = self.voice_error.clone() {
                     ui.vertical_centered(|ui| {
                         if ui.add(egui::Label::new(RichText::new(format!("{e}   ✕")).size(12.0).color(t.red)).sense(Sense::click())).clicked() {
@@ -634,7 +682,7 @@ impl eframe::App for App {
                 c.add_space(10.0);
 
                 let keyboard = data.settings.show_keyboard;
-                let n_icons = 2 + run.is_some() as usize + (keyboard && !self.input.trim().is_empty()) as usize;
+                let n_icons = 2 + run.is_some() as usize + (keyboard && (!self.input.trim().is_empty() || !self.attachments.is_empty())) as usize;
                 let middle_w = (c.available_width() - n_icons as f32 * 34.0 - 6.0).max(60.0);
                 let channel_name = data.channel(&cid).map(|c| c.name.clone()).unwrap_or_default();
                 c.allocate_ui_with_layout(vec2(middle_w, 40.0), Layout::left_to_right(Align::Center), |ui| {
@@ -655,7 +703,7 @@ impl eframe::App for App {
                         if edit.has_focus() && ctx.input(|i| i.key_pressed(Key::Escape)) {
                             edit.surrender_focus();
                         }
-                        if edit.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) && !self.input.trim().is_empty() {
+                        if edit.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) && (!self.input.trim().is_empty() || !self.attachments.is_empty()) {
                             actions.push(Action::Send(cid.clone(), self.input.trim().to_string()));
                             self.input.clear();
                             self.focus_input = true;
@@ -666,7 +714,7 @@ impl eframe::App for App {
                         ui.add(egui::Label::new(RichText::new(text).size(size).color(color)).truncate());
                     }
                 });
-                if keyboard && !self.input.trim().is_empty() && icon_button(&mut c, &t, Icon::Send, 30.0, true, "Send (Enter)").clicked() {
+                if keyboard && (!self.input.trim().is_empty() || !self.attachments.is_empty()) && icon_button(&mut c, &t, Icon::Send, 30.0, true, "Send (Enter)").clicked() {
                     actions.push(Action::Send(cid.clone(), self.input.trim().to_string()));
                     self.input.clear();
                     self.focus_input = true;
@@ -916,7 +964,14 @@ impl eframe::App for App {
 
         for a in actions {
             match a {
-                Action::Send(cid, text) => orchestrator::send(&self.shared, &cid, text),
+                Action::Send(cid, text) => {
+                    // Dropped images travel with this message (typed or spoken).
+                    let files = std::mem::take(&mut self.attachments);
+                    let folder = self.shared.data.lock().unwrap().channel(&cid).map(|c| c.folder.clone()).unwrap_or_default();
+                    let stored = store_attachments(&folder, &files);
+                    let text = if text.trim().is_empty() { "(see the attached image)".to_string() } else { text };
+                    orchestrator::send_with(&self.shared, &cid, text, stored);
+                }
                 Action::AskTeam(cid, text) => orchestrator::send(&self.shared, &cid, text),
                 Action::ShowFile(path) => {
                     let same = matches!(&self.panel, Some(Panel::File(f)) if f.path == path);
@@ -1407,6 +1462,34 @@ fn task_row(ui: &mut egui::Ui, t: &Theme, done: bool, text: &str, indent: f32) -
     });
     ui.add_space(2.0);
     clicked
+}
+
+fn is_image(p: &std::path::Path) -> bool {
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
+}
+
+/// Copy attachments into <project>/.yesharness/attachments so sandboxed agents can read them.
+/// That folder ignores itself in Git. Returns absolute paths (falls back to the original file).
+fn store_attachments(folder: &str, files: &[std::path::PathBuf]) -> Vec<String> {
+    let base = std::path::Path::new(folder).join(".yesharness");
+    let dir = base.join("attachments");
+    let ok = std::fs::create_dir_all(&dir).is_ok();
+    if ok && !base.join(".gitignore").exists() {
+        let _ = std::fs::write(base.join(".gitignore"), "# YesHarness attachments: not part of your project\n*\n");
+    }
+    files
+        .iter()
+        .map(|f| {
+            let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image.png".into());
+            let dest = dir.join(format!("{}-{name}", model::new_id()));
+            if ok && std::fs::copy(f, &dest).is_ok() {
+                dest.to_string_lossy().into_owned()
+            } else {
+                f.to_string_lossy().into_owned()
+            }
+        })
+        .collect()
 }
 
 /// A small rounded label in the header.
@@ -2292,6 +2375,17 @@ fn message(ui: &mut egui::Ui, t: &Theme, data: &Data, m: &model::Message, prev: 
                     ui.add(egui::Label::new(RichText::new(&m.text).size(14.0).color(Color32::WHITE)).wrap());
                 });
             });
+            if !m.attachments.is_empty() {
+                ui.add_space(4.0);
+                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                    for a in m.attachments.iter().rev() {
+                        let img = egui::Image::new(format!("file://{a}")).max_size(vec2(220.0, 160.0)).maintain_aspect_ratio(true).corner_radius(12);
+                        if ui.add(img.sense(Sense::click())).on_hover_text("Click to open").clicked() {
+                            open_path(std::path::Path::new(a));
+                        }
+                    }
+                });
+            }
         }
         Author::Heartbeat => {
             ui.add_space(12.0);
@@ -2658,6 +2752,22 @@ mod tests {
                 render_file(ui, &t, "# Tasks\n\n- [ ] one\n\n\n## Done\n- [x] two\n\n");
             });
         });
+    }
+
+    #[test]
+    fn attachments_are_copied_into_the_project() {
+        let proj = std::env::temp_dir().join(format!("yh-att-{}", model::new_id()));
+        std::fs::create_dir_all(&proj).unwrap();
+        let src = std::env::temp_dir().join(format!("shot-{}.png", model::new_id()));
+        std::fs::write(&src, b"png").unwrap();
+        let stored = store_attachments(proj.to_str().unwrap(), std::slice::from_ref(&src));
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].starts_with(proj.join(".yesharness/attachments").to_str().unwrap()), "{stored:?}");
+        assert!(std::path::Path::new(&stored[0]).is_file());
+        assert!(std::fs::read_to_string(proj.join(".yesharness/.gitignore")).unwrap().contains('*'));
+        assert!(is_image(&src) && !is_image(std::path::Path::new("notes.txt")));
+        let _ = std::fs::remove_dir_all(proj);
+        let _ = std::fs::remove_file(src);
     }
 
     #[test]

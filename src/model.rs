@@ -106,10 +106,24 @@ impl Agent {
 /// Upgrade existing state without changing ids, handles, memberships, or sessions.
 fn migrate_agent_names(data: &mut Data) -> bool {
     let mut changed = false;
+    let mut rebriefed: Vec<String> = Vec::new();
     for agent in &mut data.agents {
+        // Main agents still on the default briefing get the newer, more concise one.
+        if agent.handle == "main" && agent.briefing.starts_with("You are the user's main agent, like a chief of staff") && !agent.briefing.contains("as concise as possible") {
+            agent.briefing = TEMPLATES[0].agent(agent.color).briefing;
+            rebriefed.push(agent.id.clone());
+            changed = true;
+        }
         if agent.handle == "main" && agent.display_name.is_empty() {
             agent.display_name = "Alex".into();
             changed = true;
+        }
+    }
+    // A new briefing only reaches the agent in a fresh session.
+    for ch in data.channels.iter_mut() {
+        ch.sessions.retain(|k, _| !rebriefed.iter().any(|id| k.starts_with(&format!("{id}:"))));
+        for id in &rebriefed {
+            ch.seen.remove(id);
         }
     }
     changed
@@ -137,6 +151,9 @@ pub struct Message {
     /// Which engine/model actually produced it, e.g. "Codex · gpt-6-astra".
     #[serde(default)]
     pub via: String,
+    /// Images you attached (absolute paths, copied into the project's .yesharness/attachments).
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -196,7 +213,7 @@ fn auto_theme() -> String {
 }
 
 pub fn default_speech_speed() -> f32 {
-    1.5
+    1.25
 }
 
 /// The steps of the speed control.
@@ -224,7 +241,7 @@ pub struct Data {
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Message { author: Author::System, text: text.into(), ts: now(), error: false, to_user: false, via: String::new() }
+        Message { author: Author::System, text: text.into(), ts: now(), error: false, to_user: false, via: String::new(), attachments: Vec::new() }
     }
 }
 
@@ -276,7 +293,9 @@ pub const TEMPLATES: &[Template] = &[
                    media agent). Brief all of them in the same message so they can work in parallel.\n\
                    - When they report back, check the result, then tell the user in one or two spoken sentences what \
                    happened and where to find it.\n\
-                   - Keep TASKS.md current.",
+                   - Keep TASKS.md current.\n\
+                   - Be as concise as possible. Usually one or two short sentences. No preamble, no repeating what the \
+                   user said, no explaining things they didn't ask about. Only go into detail when asked.",
     },
     Template {
         title: "Developer",

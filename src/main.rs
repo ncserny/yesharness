@@ -88,8 +88,10 @@ fn headless(texts: &[String]) {
         }
     }
     let mut printed = 0;
+    // YH_ATTACH=/path/image.png: attach an image to the first message (testing).
+    let mut attach: Vec<String> = std::env::var("YH_ATTACH").ok().into_iter().collect();
     for text in texts {
-        orchestrator::send(&shared, &cid, text.to_string());
+        orchestrator::send_with(&shared, &cid, text.to_string(), std::mem::take(&mut attach));
         printed = print_until_idle(&shared, &cid, printed);
     }
 }
