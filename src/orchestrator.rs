@@ -1370,6 +1370,24 @@ mod tests {
         }
     }
 
+    /// A command line for a stand-in agent that works on every OS (examples/fake_agent.rs): the first
+    /// (needle, reply) whose needle is in the prompt wins; "" always matches; "sleep=N;" waits first.
+    fn fake(rules: &[(&str, &str)]) -> String {
+        // The test binary lives under target/<profile>/ (deps/ or build/…); examples land in target/<profile>/examples.
+        let name = format!("fake_agent{}", std::env::consts::EXE_SUFFIX);
+        let exe = std::env::current_exe().unwrap();
+        let bin = exe
+            .ancestors()
+            .map(|d| d.join("examples").join(&name))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("examples/fake_agent isn't built (cargo test builds it); looked above {}", exe.display()));
+        let mut cmd = format!("\"{}\"", bin.display());
+        for (needle, reply) in rules {
+            cmd.push_str(&format!(" \"{needle}=>{reply}\""));
+        }
+        cmd
+    }
+
     fn channel(members: &[&str]) -> Channel {
         Channel {
             id: "c".into(),
@@ -1426,9 +1444,9 @@ mod tests {
         let lead = agent(
             "L",
             "lead",
-            r#"input=$(cat); if printf '%s' "$input" | grep -q 'NOTHING IS HAPPENING'; then echo "@helper: add the toggle"; elif printf '%s' "$input" | grep -q 'have replied above'; then echo "Done: toggle added."; else echo "On it, I'll start right away."; fi"#,
+            &fake(&[("NOTHING IS HAPPENING", "@helper: add the toggle"), ("have replied above", "Done: toggle added."), ("", "On it, I'll start right away.")]),
         );
-        let helper = agent("H", "helper", r#"cat >/dev/null; echo "Added the toggle.""#);
+        let helper = agent("H", "helper", &fake(&[("", "Added the toggle.")]));
         let data = Data { agents: vec![lead, helper], channels: vec![channel(&["L", "H"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "add a toggle".into());
@@ -1448,9 +1466,9 @@ mod tests {
         let lead = agent(
             "L",
             "lead",
-            r#"input=$(cat); if printf '%s' "$input" | grep -q 'have replied above'; then echo "All done"; elif printf '%s' "$input" | grep -q 'quick question'; then echo "quick answer"; else echo "@helper: slow task"; fi"#,
+            &fake(&[("have replied above", "All done"), ("quick question", "quick answer"), ("", "@helper: slow task")]),
         );
-        let helper = agent("H", "helper", r#"cat >/dev/null; sleep 4; echo "slow done""#);
+        let helper = agent("H", "helper", &fake(&[("", "sleep=4;slow done")]));
         let data = Data { agents: vec![lead, helper], channels: vec![channel(&["L", "H"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "do the slow thing".into());
@@ -1470,7 +1488,7 @@ mod tests {
     /// The lead is still busy when you send something else: a General helper takes it instead of making you wait.
     #[test]
     fn general_helper_steps_in_when_busy() {
-        let lead = agent("L", "main", r#"input=$(cat); if printf '%s' "$input" | grep -q 'Your role: General'; then echo "second done"; else sleep 2; echo "first done"; fi"#);
+        let lead = agent("L", "main", &fake(&[("Your role: General", "second done"), ("", "sleep=2;first done")]));
         let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "first, a slow one".into());
@@ -1549,14 +1567,13 @@ mod tests {
 
     /// Real processes: a lead that delegates to a helper, then wraps up.
     #[test]
-    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn lead_delegates_then_wraps_up() {
         let lead = agent(
             "L",
             "lead",
-            r#"input=$(cat); if printf '%s' "$input" | grep -q 'have replied above'; then echo "Final: helper says $(printf '%s' "$input" | grep -o 'ANSWER=[0-9]*' | tail -1)"; else echo "On it."; echo "@helper: compute 2+2"; fi"#,
+            &fake(&[("have replied above", "Final: helper says {last:ANSWER=}"), ("", "On it.\\n@helper: compute 2+2")]),
         );
-        let helper = agent("H", "helper", r#"cat >/dev/null; echo "ANSWER=4""#);
+        let helper = agent("H", "helper", &fake(&[("", "ANSWER=4")]));
         let data = Data { agents: vec![lead, helper], channels: vec![channel(&["L", "H"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "what is 2+2?".into());
@@ -1570,20 +1587,15 @@ mod tests {
 
     /// Two teammates briefed in one message work at the same time.
     #[test]
-    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn handoffs_run_in_parallel() {
         // Each helper marks that it started, waits, then checks whether the other one started too.
         // Run one after another, neither would see the other; in parallel, both do.
         let dir = std::env::temp_dir().join(format!("yh-par-{}", model::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.display();
-        let lead = agent(
-            "L",
-            "lead",
-            r#"input=$(cat); if printf '%s' "$input" | grep -q 'have replied above'; then echo "All done"; else echo "@one: task A"; echo "@two: task B"; fi"#,
-        );
-        let one = agent("1", "one", &format!(r#"cat >/dev/null; touch {d}/one; sleep 2; [ -f {d}/two ] && echo "A saw B" || echo "A alone""#));
-        let two = agent("2", "two", &format!(r#"cat >/dev/null; touch {d}/two; sleep 2; [ -f {d}/one ] && echo "B saw A" || echo "B alone""#));
+        let (a, b) = (dir.join("one").display().to_string(), dir.join("two").display().to_string());
+        let lead = agent("L", "lead", &fake(&[("have replied above", "All done"), ("", "@one: task A\\n@two: task B")]));
+        let one = agent("1", "one", &fake(&[("", &format!("touch={a};sleep=2;{{file:{b}?A saw B|A alone}}"))]));
+        let two = agent("2", "two", &fake(&[("", &format!("touch={b};sleep=2;{{file:{a}?B saw A|B alone}}"))]));
         let data = Data { agents: vec![lead, one, two], channels: vec![channel(&["L", "1", "2"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "do A and B".into());
@@ -1615,16 +1627,15 @@ mod tests {
 
     /// The main agent creates a channel and hands the work over; the team there starts on it.
     #[test]
-    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn main_agent_creates_channel_and_hands_over() {
         let dir = std::env::temp_dir().join(format!("yh-newch-{}", model::new_id()));
         let lead = agent(
             "L",
             "lead",
-            &format!(
-                r#"input=$(cat); if printf '%s' "$input" | grep -q 'Passed on from'; then echo "Starting on recipes"; else echo "Opening a channel for that."; echo "/new-channel recipes {}"; echo "/send recipes Build a recipe website"; fi"#,
-                dir.display()
-            ),
+            &fake(&[
+                ("Passed on from", "Starting on recipes"),
+                ("", &format!("Opening a channel for that.\\n/new-channel recipes {}\\n/send recipes Build a recipe website", dir.display())),
+            ]),
         );
         let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: Some("c".into()), settings: Default::default() };
         let shared = Shared::quiet(data);
@@ -1690,10 +1701,9 @@ mod tests {
 
     /// "Everyone" with one agent out of quota: the other answers once, not twice.
     #[test]
-    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn stand_in_answers_once() {
-        let lead = agent("L", "lead", r#"cat >/dev/null; echo "You've hit your usage limit" >&2; exit 1"#);
-        let backup = agent("B", "backup", r#"cat >/dev/null; echo "backup here""#);
+        let lead = agent("L", "lead", &fake(&[("", "fail;You've hit your usage limit")]));
+        let backup = agent("B", "backup", &fake(&[("", "backup here")]));
         let data = Data { agents: vec![lead, backup], channels: vec![channel(&["L", "B"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "Everyone, status?".into());
@@ -1703,10 +1713,9 @@ mod tests {
 
     /// The lead is out of quota: the other agent answers instead.
     #[test]
-    #[cfg_attr(windows, ignore = "Unix shell fixture; Windows equivalent pending")]
     fn fails_over_when_lead_hits_its_limit() {
-        let lead = agent("L", "lead", r#"cat >/dev/null; echo "You've hit your usage limit" >&2; exit 1"#);
-        let backup = agent("B", "backup", r#"cat >/dev/null; echo "backup here""#);
+        let lead = agent("L", "lead", &fake(&[("", "fail;You've hit your usage limit")]));
+        let backup = agent("B", "backup", &fake(&[("", "backup here")]));
         let data = Data { agents: vec![lead, backup], channels: vec![channel(&["L", "B"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "hello".into());
