@@ -15,7 +15,8 @@
 //                       Closing stdin stops listening.
 // Output lines: R: (mic live)  L:<0..1> (level)  P:<partial>  U:<utterance>  F:<final>
 //               I:<info>  E:<error>
-// Env: YH_LOCALE (e.g. de-DE), YH_PAUSE (seconds of silence that ends an utterance, default 0.9)
+// Env: YH_LOCALE (e.g. de-DE), YH_PAUSE (seconds of silence that ends an utterance, default 0.9),
+//      YH_VP=0 (hands-free without echo cancellation)
 
 import AVFoundation
 import Foundation
@@ -62,6 +63,18 @@ final class Mic {
 
     func start(_ onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
         let input = engine.inputNode
+        // Always-listening: Apple's echo cancellation removes what the Mac itself plays (agents reading
+        // replies aloud), so you can interrupt them by talking. YH_VP=0 turns it off.
+        if handsFree && env["YH_VP"] != "0" {
+            do {
+                try input.setVoiceProcessingEnabled(true)
+                // Don't turn other sound (the agents' voices, your music) down while listening.
+                input.voiceProcessingOtherAudioDuckingConfiguration = AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                    enableAdvancedDucking: false, duckingLevel: .min)
+            } catch {
+                out("I:Echo cancellation unavailable: \(error.localizedDescription)")
+            }
+        }
         let format = input.outputFormat(forBus: 0)
         if format.sampleRate == 0 || format.channelCount == 0 { fail("No microphone found.") }
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [self] buf, _ in
