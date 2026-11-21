@@ -9,7 +9,7 @@ use crate::probe::{self, Health};
 use crate::theme::Theme;
 use crate::voice::{self, Dictation, Mode};
 use eframe::egui::{
-    self, text::LayoutJob, vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Rect, RichText,
+    self, Modifiers, text::LayoutJob, vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Rect, RichText,
     ScrollArea, Sense, Shadow, Stroke, TextFormat, UiBuilder, Vec2,
 };
 use global_hotkey::hotkey::{Code, HotKey, Modifiers as HkMods};
@@ -658,8 +658,10 @@ impl eframe::App for App {
                 }
                 let listening = voice_state.is_some();
                 let width = ui.available_width().min(640.0);
-                let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
-                let capsule = Rect::from_center_size(row.center(), vec2(width, 56.0));
+                let lines = if data.settings.show_keyboard { self.input.split('\n').count().clamp(1, 6) } else { 1 };
+                let height = 56.0 + (lines - 1) as f32 * 19.0;
+                let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+                let capsule = Rect::from_center_size(row.center(), vec2(width, height));
                 let p = ui.painter();
                 p.add(Shadow { offset: [0, 4], blur: 18, spread: 0, color: Color32::from_black_alpha(if t.dark { 70 } else { 22 }) }.as_shape(capsule, 28));
                 p.rect(capsule, 28.0, t.card, Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
@@ -685,15 +687,22 @@ impl eframe::App for App {
                 let n_icons = 2 + run.is_some() as usize + (keyboard && (!self.input.trim().is_empty() || !self.attachments.is_empty())) as usize;
                 let middle_w = (c.available_width() - n_icons as f32 * 34.0 - 6.0).max(60.0);
                 let channel_name = data.channel(&cid).map(|c| c.name.clone()).unwrap_or_default();
-                c.allocate_ui_with_layout(vec2(middle_w, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                c.allocate_ui_with_layout(vec2(middle_w, height - 16.0), Layout::left_to_right(Align::Center), |ui| {
                     if keyboard {
                         let id = Id::new(COMPOSER);
+                        // Enter sends; Shift+Enter is a new line (taken before the text box sees it).
+                        let mut enter = false;
+                        if ctx.memory(|m| m.has_focus(id)) && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift) {
+                            ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                            enter = true;
+                        }
                         let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.input)
+                            egui::TextEdit::multiline(&mut self.input)
                                 .id(id)
                                 .frame(false)
                                 .font(FontId::proportional(14.0))
-                                .hint_text(RichText::new(format!("Message #{channel_name}")).color(t.tertiary))
+                                .hint_text(RichText::new(format!("Message #{channel_name}   (Shift+Enter for a new line)")).color(t.tertiary))
+                                .desired_rows(1)
                                 .desired_width(middle_w),
                         );
                         if self.focus_input {
@@ -703,7 +712,7 @@ impl eframe::App for App {
                         if edit.has_focus() && ctx.input(|i| i.key_pressed(Key::Escape)) {
                             edit.surrender_focus();
                         }
-                        if edit.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) && (!self.input.trim().is_empty() || !self.attachments.is_empty()) {
+                        if enter && (!self.input.trim().is_empty() || !self.attachments.is_empty()) {
                             actions.push(Action::Send(cid.clone(), self.input.trim().to_string()));
                             self.input.clear();
                             self.focus_input = true;
