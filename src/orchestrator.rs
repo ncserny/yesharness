@@ -1659,7 +1659,10 @@ mod tests {
         loop {
             let done = {
                 let data = shared.data.lock().unwrap();
-                let ch = data.channels.iter().find(|c| c.name == "recipes").expect("channel created");
+                let ch = data.channels.iter().find(|c| c.name == "recipes").unwrap_or_else(|| {
+                    let all: Vec<(&str, &str)> = data.channels.iter().map(|c| (c.name.as_str(), c.folder.as_str())).collect();
+                    panic!("channel not created; channels: {all:?}; messages: {msgs:#?}")
+                });
                 assert_eq!(data.selected.as_deref(), Some(ch.id.as_str()));
                 ch.messages.iter().any(|m| m.text == "Starting on recipes")
             };
