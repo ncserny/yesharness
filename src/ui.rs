@@ -657,15 +657,27 @@ impl eframe::App for App {
             .map(|(k, r)| (k.clone(), (r.working.clone(), r.started.elapsed().as_secs(), r.queue.len())))
             .collect();
 
-        // ------------------------------------------------ sidebar
+        // ------------------------------------------------ sidebar (Ctrl+Cmd+S or the sidebar button hides it)
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::COMMAND, Key::S)) {
+            data.settings.sidebar_hidden = !data.settings.sidebar_hidden;
+            shared.dirty.store(true, Ordering::Relaxed);
+        }
+        let sidebar_shown = !data.settings.sidebar_hidden;
+        let mut toggle_sidebar = false;
+        let mut toggle_team = false;
         egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(236.0)
             .width_range(200.0..=320.0)
             .frame(Frame::new().fill(t.sidebar).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
-            .show(ctx, |ui| {
+            .show_animated(ctx, sidebar_shown, |ui| {
                 let top = Rect::from_min_size(ui.max_rect().min, vec2(ui.available_width(), TITLEBAR));
                 window_drag(ui, top, "sidebar-drag");
+                // Hide button, top right (the traffic lights are on the left).
+                let b = Rect::from_center_size(egui::pos2(top.right() - 12.0, top.top() + 19.0), Vec2::splat(24.0));
+                if ui.put(b, |ui: &mut egui::Ui| icon_button(ui, &t, Icon::Sidebar, 24.0, false, "Hide sidebar (Ctrl+Cmd+S)")).clicked() {
+                    toggle_sidebar = true;
+                }
                 ui.add_space(TITLEBAR);
 
                 ui.horizontal(|ui| {
@@ -680,7 +692,7 @@ impl eframe::App for App {
                         }
                     });
                 });
-                let team_h = 70.0 + data.agents.len() as f32 * 40.0;
+                let team_h = 70.0 + if data.settings.team_collapsed { 0.0 } else { data.agents.len() as f32 * 40.0 };
                 ScrollArea::vertical()
                     .id_salt("channels")
                     .auto_shrink([false, true])
@@ -722,17 +734,44 @@ impl eframe::App for App {
                         }
                     });
                     ui.add_space(2.0);
-                    for a in data.agents.iter().rev() {
-                        let (line, col, tip) = role_status(a, &health, &t);
-                        if agent_row(ui, &t, a, &line, col).on_hover_text(tip).clicked() {
-                            self.team_sel = Some(a.id.clone());
-                            self.show_team = true;
+                    let collapsed = data.settings.team_collapsed;
+                    if collapsed {
+                        // Folded: just the faces, side by side.
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            for a in &data.agents {
+                                let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                                icons::avatar(ui.painter(), r.center(), 10.0, color(a.color), a.name().chars().next().unwrap_or('?'));
+                                let (line, _, _) = role_status(a, &health, &t);
+                                if resp.on_hover_text(format!("{} · {line}", a.name())).clicked() {
+                                    self.team_sel = Some(a.id.clone());
+                                    self.show_team = true;
+                                }
+                            }
+                        });
+                    } else {
+                        for a in data.agents.iter().rev() {
+                            let (line, col, tip) = role_status(a, &health, &t);
+                            if agent_row(ui, &t, a, &line, col).on_hover_text(tip).clicked() {
+                                self.team_sel = Some(a.id.clone());
+                                self.show_team = true;
+                            }
                         }
                     }
                     ui.add_space(4.0);
-                    section_label(ui, &t, "Your team");
+                    if fold_label(ui, &t, "Your team", collapsed).clicked() {
+                        toggle_team = true;
+                    }
                 });
             });
+        if toggle_sidebar {
+            data.settings.sidebar_hidden = !data.settings.sidebar_hidden;
+            shared.dirty.store(true, Ordering::Relaxed);
+        }
+        if toggle_team {
+            data.settings.team_collapsed = !data.settings.team_collapsed;
+            shared.dirty.store(true, Ordering::Relaxed);
+        }
 
         let Some(cid) = selected.clone() else {
             egui::CentralPanel::default().frame(Frame::new().fill(t.bg)).show(ctx, |ui| {
@@ -947,11 +986,21 @@ impl eframe::App for App {
                 let edge = ui.max_rect();
                 ui.painter().hline(edge.left() - 20.0..=edge.right() + 20.0, edge.bottom() - 0.5, Stroke::new(1.0_f32, t.separator));
                 window_drag(ui, ui.max_rect(), "header-drag");
+                let sidebar_hidden = data.settings.sidebar_hidden;
+                let mut show_sidebar = false;
                 let memory_on = data.settings.memory;
                 let Data { agents, channels, selected, .. } = &mut *data;
                 let Some(idx) = channels.iter().position(|c| c.id == cid) else { return };
                 let mut delete = false;
                 ui.horizontal_centered(|ui| {
+                    if sidebar_hidden {
+                        // Room for the window buttons, then the button that brings the sidebar back.
+                        ui.add_space(if cfg!(target_os = "macos") { 56.0 } else { 0.0 });
+                        if icon_button(ui, &t, Icon::Sidebar, 26.0, false, "Show sidebar (Ctrl+Cmd+S)").clicked() {
+                            show_sidebar = true;
+                        }
+                        ui.add_space(6.0);
+                    }
                     let ch = &mut channels[idx];
                     ui.vertical(|ui| {
                     ui.add_space(9.0);
@@ -1075,6 +1124,10 @@ impl eframe::App for App {
                     *selected = channels.first().map(|c| c.id.clone());
                     shared.dirty.store(true, Ordering::Relaxed);
                     actions.push(Action::Stop(cid.clone()));
+                }
+                if show_sidebar {
+                    data.settings.sidebar_hidden = false;
+                    shared.dirty.store(true, Ordering::Relaxed);
                 }
             });
 
@@ -1253,6 +1306,18 @@ fn window_drag(ui: &mut egui::Ui, rect: Rect, id: &str) {
         let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
     }
+}
+
+/// A section title you can click to fold the section away (a small chevron shows which way).
+fn fold_label(ui: &mut egui::Ui, t: &Theme, text: &str, folded: bool) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.0), t.tertiary);
+    let (r, resp) = ui.allocate_exact_size(vec2(galley.size().x + 18.0, 18.0), Sense::click());
+    let col = if resp.hovered() { t.secondary } else { t.tertiary };
+    ui.painter().galley(egui::pos2(r.left(), r.center().y - galley.size().y / 2.0), galley, col);
+    let c = egui::pos2(r.right() - 6.0, r.center().y);
+    let pts = if folded { vec![c + vec2(-2.0, -3.5), c + vec2(2.0, 0.0), c + vec2(-2.0, 3.5)] } else { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.5), c + vec2(3.5, -1.5)] };
+    ui.painter().add(egui::Shape::line(pts, Stroke::new(1.3_f32, col)));
+    resp.on_hover_text(if folded { "Show your team" } else { "Fold away" })
 }
 
 fn section_label(ui: &mut egui::Ui, t: &Theme, text: &str) {

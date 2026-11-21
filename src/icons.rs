@@ -19,6 +19,7 @@ pub enum Icon {
     Play,
     Close,
     Back,
+    Sidebar,
 }
 
 fn arc(c: Pos2, r: f32, a0: f32, a1: f32) -> Vec<Pos2> {
@@ -107,6 +108,12 @@ pub fn paint(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
         }
         Icon::Play => {
             p.add(Shape::convex_polygon(vec![at(-3.5, -5.0), at(5.0, 0.0), at(-3.5, 5.0)], color, Stroke::NONE));
+        }
+        Icon::Sidebar => {
+            // A window with a sidebar on the left (like macOS's "Show Sidebar").
+            let r = Rect::from_center_size(c, vec2(13.0 * s, 10.5 * s));
+            p.rect_stroke(r, 2.2 * s, st, eframe::egui::StrokeKind::Middle);
+            p.line_segment([pos2(r.left() + 4.5 * s, r.top()), pos2(r.left() + 4.5 * s, r.bottom())], st);
         }
     }
 }

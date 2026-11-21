@@ -224,6 +224,12 @@ pub struct Settings {
     /// Alex's routine turns use one cheap, tool-free call; it switches to its full tools only when needed.
     #[serde(default = "yes")]
     pub quick_routing: bool,
+    /// The sidebar is hidden (Ctrl+Cmd+S or the sidebar button toggles it).
+    #[serde(default)]
+    pub sidebar_hidden: bool,
+    /// The "Your team" list in the sidebar is folded away.
+    #[serde(default)]
+    pub team_collapsed: bool,
     /// The first-run questions were answered (or skipped).
     #[serde(default)]
     pub onboarded: bool,
@@ -271,7 +277,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, voice_engine: local(), barge_in: true, onboarded: false, languages: Vec::new() }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, voice_engine: local(), barge_in: true, onboarded: false, languages: Vec::new(), sidebar_hidden: false, team_collapsed: false }
     }
 }
 
