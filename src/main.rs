@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod agents;
+mod elevenlabs;
 mod env;
 mod heartbeat;
 mod icons;

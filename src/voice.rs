@@ -258,7 +258,43 @@ pub fn set_speed(speed: f32) {
     RATE.store(wpm, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Queue `text` to be spoken in `voice` ("" = system voice). Agents take turns, like people.
+/// Read replies with ElevenLabs instead of Apple's voices (set from Settings every frame).
+static ELEVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Busy with one reply from start to end (also between ElevenLabs pieces, when nothing is playing).
+static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Bumped by stop_speaking, so a reply being fetched from ElevenLabs stops too.
+static STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_engine(elevenlabs: bool) {
+    ELEVEN.store(elevenlabs, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn uses_elevenlabs() -> bool {
+    ELEVEN.load(std::sync::atomic::Ordering::Relaxed) && crate::elevenlabs::has_key()
+}
+
+/// The voice to read the n-th agent's replies with: "el:<ElevenLabs id>|<Apple fallback>" or an Apple voice.
+pub fn agent_voice(n: usize, apple: &str, eleven: &str) -> String {
+    let apple = if apple.is_empty() { auto_voice(n) } else { apple.to_string() };
+    if !uses_elevenlabs() {
+        return apple;
+    }
+    let el = if eleven.is_empty() { crate::elevenlabs::auto_voice(n) } else { eleven.to_string() };
+    format!("el:{el}|{apple}")
+}
+
+/// "el:<id>|<apple>" -> (Some(id), apple); an Apple voice -> (None, voice).
+fn parse_voice(v: &str) -> (Option<&str>, &str) {
+    match v.strip_prefix("el:") {
+        Some(rest) => {
+            let (id, apple) = rest.split_once('|').unwrap_or((rest, ""));
+            (Some(id).filter(|i| !i.is_empty()), apple)
+        }
+        None => (None, v),
+    }
+}
+
+/// Queue `text` to be spoken in `voice` ("" = system voice; see agent_voice). Agents take turns, like people.
 pub fn speak(text: &str, voice: &str) {
     let t = speakable(text);
     if t.is_empty() || !cfg!(target_os = "macos") {
@@ -274,38 +310,113 @@ pub fn speak(text: &str, voice: &str) {
     QUEUE.lock().unwrap().push_back((t, voice.to_string()));
     WORKER.call_once(|| {
         std::thread::spawn(|| loop {
-            let next = QUEUE.lock().unwrap().pop_front();
+            let next = {
+                let mut q = QUEUE.lock().unwrap();
+                let n = q.pop_front();
+                // Mark busy before the queue looks empty, so speaking() never blinks off between items.
+                BUSY.store(n.is_some(), std::sync::atomic::Ordering::SeqCst);
+                n
+            };
             let Some((text, voice)) = next else {
                 std::thread::sleep(std::time::Duration::from_millis(60));
                 continue;
             };
-            let mut cmd = Command::new("say");
-            if !voice.is_empty() {
-                cmd.args(["-v", &voice]);
+            let (eleven, apple) = parse_voice(&voice);
+            let done = match eleven {
+                Some(id) if uses_elevenlabs() => speak_elevenlabs(&text, id, apple),
+                _ => false,
+            };
+            if !done {
+                say(&text, apple);
             }
-            let rate = RATE.load(std::sync::atomic::Ordering::Relaxed).to_string();
-            if let Ok(child) = cmd.args(["-r", &rate]).arg(&text).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-                *SAY.lock().unwrap() = Some(child);
-                loop {
-                    *LAST_SPOKE.lock().unwrap() = Some(Instant::now());
-                    let mut g = SAY.lock().unwrap();
-                    match g.as_mut().map(|c| c.try_wait()) {
-                        Some(Ok(None)) => {}
-                        _ => {
-                            *g = None;
-                            break;
-                        }
-                    }
-                    drop(g);
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                *LAST_SPOKE.lock().unwrap() = Some(Instant::now());
-            }
+            *LAST_SPOKE.lock().unwrap() = Some(Instant::now());
         });
     });
 }
 
+/// Plays a command (say / afplay) to the end, or until stop_speaking kills it.
+fn play(mut cmd: Command) {
+    let Ok(child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
+    *SAY.lock().unwrap() = Some(child);
+    loop {
+        *LAST_SPOKE.lock().unwrap() = Some(Instant::now());
+        let mut g = SAY.lock().unwrap();
+        match g.as_mut().map(|c| c.try_wait()) {
+            Some(Ok(None)) => {}
+            _ => {
+                *g = None;
+                break;
+            }
+        }
+        drop(g);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn say(text: &str, voice: &str) {
+    let mut cmd = Command::new("say");
+    if !voice.is_empty() {
+        cmd.args(["-v", voice]);
+    }
+    let rate = RATE.load(std::sync::atomic::Ordering::Relaxed).to_string();
+    cmd.args(["-r", &rate]).arg(text);
+    play(cmd);
+}
+
+/// Reads `text` with ElevenLabs: fetches the next piece while the current one plays.
+/// Returns false if nothing could be played (then the Apple voice reads it instead).
+fn speak_elevenlabs(text: &str, voice: &str, apple: &str) -> bool {
+    let stops = STOPS.load(std::sync::atomic::Ordering::SeqCst);
+    let speed = RATE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 200.0;
+    let pieces = crate::elevenlabs::pieces(text);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<PathBuf, String>>(2);
+    let voice_id = voice.to_string();
+    let fetch_pieces = pieces.clone();
+    std::thread::spawn(move || {
+        for (i, p) in fetch_pieces.iter().enumerate() {
+            if STOPS.load(std::sync::atomic::Ordering::SeqCst) != stops {
+                return;
+            }
+            let r = crate::elevenlabs::synthesize(p, &voice_id, speed).and_then(|audio| {
+                let f = std::env::temp_dir().join(format!("yh-tts-{}-{i}.mp3", crate::model::new_id()));
+                std::fs::write(&f, audio).map(|_| f).map_err(|e| e.to_string())
+            });
+            let failed = r.is_err();
+            if tx.send(r).is_err() || failed {
+                return;
+            }
+        }
+    });
+    let mut played = 0;
+    for (i, r) in rx.iter().enumerate() {
+        if STOPS.load(std::sync::atomic::Ordering::SeqCst) != stops {
+            if let Ok(f) = r {
+                let _ = std::fs::remove_file(f);
+            }
+            return true;
+        }
+        match r {
+            Ok(f) => {
+                let mut cmd = Command::new("afplay");
+                cmd.arg(&f);
+                play(cmd);
+                let _ = std::fs::remove_file(&f);
+                played += 1;
+            }
+            Err(_) => {
+                // Read the rest with the Apple voice rather than stopping mid-reply.
+                if played > 0 {
+                    say(&pieces[i..].join(" "), apple);
+                }
+                return played > 0;
+            }
+        }
+    }
+    played > 0 || STOPS.load(std::sync::atomic::Ordering::SeqCst) != stops
+}
+
 pub fn stop_speaking() {
+    STOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     QUEUE.lock().unwrap().clear();
     if let Some(mut c) = SAY.lock().unwrap().take() {
         let _ = c.kill();
@@ -314,7 +425,7 @@ pub fn stop_speaking() {
 }
 
 pub fn speaking() -> bool {
-    SAY.lock().unwrap().is_some() || !QUEUE.lock().unwrap().is_empty()
+    BUSY.load(std::sync::atomic::Ordering::SeqCst) || SAY.lock().unwrap().is_some() || !QUEUE.lock().unwrap().is_empty()
 }
 
 /// True while speaking and shortly after (room echo), so hands-free mode doesn't transcribe our own voice.

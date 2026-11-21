@@ -65,6 +65,9 @@ pub struct Agent {
     /// macOS voice for reading its replies ("" = automatic, a different one per agent).
     #[serde(default)]
     pub voice: String,
+    /// ElevenLabs voice id, when replies are read with ElevenLabs ("" = automatic).
+    #[serde(default)]
+    pub eleven_voice: String,
     /// How hard it thinks: "low" (quick), "" (the engine's default) or "high" (deep).
     #[serde(default)]
     pub effort: String,
@@ -221,6 +224,9 @@ pub struct Settings {
     /// Alex's routine turns use one cheap, tool-free call; it switches to its full tools only when needed.
     #[serde(default = "yes")]
     pub quick_routing: bool,
+    /// Reading replies aloud: "apple" (macOS voices) or "elevenlabs" (needs your API key; Apple is the fallback).
+    #[serde(default = "apple")]
+    pub tts_engine: String,
     /// Speech recognition: "apple" (built in) or "parakeet" (Parakeet Ultra, downloaded once).
     #[serde(default = "default_engine")]
     pub stt_engine: String,
@@ -230,6 +236,10 @@ pub struct Settings {
 }
 
 /// Parakeet Ultra by default: clearly more accurate. Apple's recognizer is used until it's set up.
+fn apple() -> String {
+    "apple".into()
+}
+
 fn default_engine() -> String {
     "parakeet".into()
 }
@@ -251,7 +261,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, tts_engine: apple() }
     }
 }
 
@@ -409,6 +419,7 @@ impl Template {
             description: self.role.into(),
             briefing: self.briefing.split_whitespace().collect::<Vec<_>>().join(" ").replace(" - ", "\n- "),
             voice: String::new(),
+            eleven_voice: String::new(),
             // The main agent mostly routes and summarizes: quick thinking keeps the conversation snappy.
             effort: if self.handle == "main" { "low".into() } else { String::new() },
             use_my_plugins: false,

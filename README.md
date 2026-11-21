@@ -124,6 +124,10 @@ straight from the folder (no `git` needed), refreshed every minute and after eac
 - **Voice:** always-listening or push-to-talk, read replies, speed, and natural voices. Apple's free
   Premium/Enhanced voices (System Settings → Accessibility → Spoken Content → System voice → Manage Voices…)
   sound far more human. YesHarness picks them up automatically, and the main agent gets the best one.
+- **ElevenLabs voices (optional):** Settings → Voice → Voices → ElevenLabs, then paste your API key (stored in the
+  macOS Keychain, not in YesHarness's files). Pick a voice per agent under Team. Replies are read sentence by
+  sentence, so speech starts quickly. If the key is wrong, credits run out or you're offline, the Apple voice
+  takes over. Each reply read aloud uses your ElevenLabs credits (replies are capped at 1,500 characters).
 
 ### Memory
 Each channel has a long-term memory, in the style of [Letta](https://github.com/letta-ai/letta), with no extra
@@ -196,6 +200,7 @@ YH_LEAD=codex YH_CODEX_MODEL=gpt-6-sol target/release/yesharness --ask "hi" "wha
 - `src/heartbeat.rs`: the 1-minute watcher for AGENTS.md / TASKS.md / docs
 - `src/inbox.rs`: `--send` / `--new-channel` control of the running app
 - `src/memory.rs`: long-term memory per channel (note kept by a local model, in-app bge-m3 recall)
+- `src/elevenlabs.rs`: optional ElevenLabs voices (Keychain key, voice list, speech)
 - `src/voice.rs` + `helper/dictate.swift`: speech-to-text (push-to-talk, hands-free) and reading replies aloud
 
 Test the speech engine without a microphone:
