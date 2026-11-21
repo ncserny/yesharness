@@ -3,9 +3,9 @@
 //! - **Memory blocks**: a short Markdown note per channel ("About you", "Project", "Decisions") that every
 //!   agent gets at the start of a conversation. When a conversation pauses, the local Ollama model rewrites
 //!   the note from what was said, so it costs nothing against your Claude/Codex limits. You can edit it.
-//! - **Recall**: every message is embedded with bge-m3 (Ollama, downloaded automatically if missing) and
-//!   stored next to the note. Agents get the few older messages most relevant to what you just asked,
-//!   instead of the whole history.
+//! - **Recall**: every message is embedded with bge-m3, run inside the app (ONNX, int8, ~570 MB downloaded
+//!   from Hugging Face the first time; no Ollama needed) and stored next to the note. Agents get the few
+//!   older messages most relevant to what you just asked, instead of the whole history.
 //!
 //! Everything lives in `<app data>/YesHarness/memory/<channel id>/`.
 
@@ -14,15 +14,18 @@ use crate::orchestrator::Shared;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// The embedding model (multilingual, ~1.2 GB). Pulled through Ollama when it isn't installed.
-pub const EMBED_MODEL: &str = "bge-m3";
+/// The embedding model: BGE-M3 (multilingual), int8 ONNX, run in-process.
+pub const EMBED_REPO: &str = "gpahal/bge-m3-onnx-int8";
+const EMBED_FILES: [&str; 5] = ["config.json", "special_tokens_map.json", "tokenizer_config.json", "tokenizer.json", "model_quantized.onnx"];
+/// Unload the model (~600 MB of RAM) after this long without use; it reloads in a second or two.
+const IDLE_UNLOAD: Duration = Duration::from_secs(600);
 /// How similar an older message must be to count as relevant (cosine, bge-m3).
 const MIN_SCORE: f32 = 0.5;
 /// Older messages recalled per turn.
@@ -44,8 +47,6 @@ const SECTIONS: [&str; 3] = ["## About the user", "## Project", "## Decisions"];
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
     Starting,
-    /// Ollama isn't installed or won't start: the note still works, recall doesn't.
-    NoOllama,
     /// Downloading bge-m3: percent.
     Downloading(u8),
     Ready,
@@ -123,7 +124,7 @@ fn save_state(cid: &str, s: &State) {
     let _ = std::fs::write(dir(cid).join("state.json"), serde_json::to_string_pretty(s).unwrap_or_default());
 }
 
-// ------------------------------------------------------------------ Ollama (plain HTTP, no extra crates)
+// ------------------------------------------------------------------ Ollama (optional: writes the note; plain HTTP)
 
 const OLLAMA: &str = "127.0.0.1:11434";
 
@@ -167,82 +168,95 @@ fn installed_models() -> Option<Vec<String>> {
     Some(tags["models"].as_array()?.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect())
 }
 
-fn has_model(names: &[String], model: &str) -> bool {
-    names.iter().any(|n| n == model || n.strip_suffix(":latest") == Some(model) || n.split(':').next() == Some(model) && !model.contains(':'))
+
+// ------------------------------------------------------------------ bge-m3, in the app
+
+/// Where the model is kept (Hugging Face cache layout).
+fn models_dir() -> PathBuf {
+    model::data_file().parent().map(|p| p.join("models")).unwrap_or_else(|| PathBuf::from("models"))
 }
 
-/// Downloads a model through Ollama, reporting progress (0–100).
-pub fn pull(model: &str, mut progress: impl FnMut(u8)) -> Result<(), String> {
-    let mut s = connect(Duration::from_secs(120))?;
-    send_request(&mut s, "/api/pull", &json!({ "model": model, "stream": true }))?;
-    let mut r = BufReader::new(s);
-    // Skip the HTTP headers.
-    let mut line = String::new();
-    let mut status_line = String::new();
-    loop {
-        line.clear();
-        if r.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-            return Err("Ollama closed the connection".into());
-        }
-        if status_line.is_empty() {
-            status_line = line.trim().to_string();
-        }
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-    let mut last_err = None;
-    let mut ok = false;
-    for l in r.lines() {
-        let l = l.map_err(|e| e.to_string())?;
-        let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
-        if let Some(e) = v["error"].as_str() {
-            last_err = Some(e.to_string());
-        }
-        if let (Some(done), Some(total)) = (v["completed"].as_u64(), v["total"].as_u64()) {
-            // Only the big layer matters; small ones flash 0→100 and would make the number jump.
-            if total > 20_000_000 {
-                progress((done * 100 / total.max(1)).min(99) as u8);
-            }
-        }
-        if v["status"].as_str() == Some("success") {
-            ok = true;
-        }
-    }
-    match (ok, last_err) {
-        (true, _) => {
-            progress(100);
-            Ok(())
-        }
-        (false, Some(e)) => Err(e),
-        (false, None) => Err(format!("download didn't finish ({status_line})")),
-    }
+struct Embedder {
+    model: fastembed::Bgem3Embedding,
+    used: std::time::Instant,
 }
 
-/// Starts Ollama if needed and makes sure bge-m3 is there, downloading it the first time.
-pub fn ensure_embedder(shared: Option<&Shared>) -> bool {
-    let mut names = installed_models();
-    if names.is_none() {
-        crate::probe::start_ollama();
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(500));
-            names = installed_models();
-            if names.is_some() {
-                break;
-            }
+fn embedder() -> &'static Mutex<Option<Embedder>> {
+    static E: OnceLock<Mutex<Option<Embedder>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(None))
+}
+
+/// Reports download progress of the big file (the small ones would make the number jump).
+struct Progress<'a> {
+    total: usize,
+    done: usize,
+    report: &'a mut dyn FnMut(u8),
+}
+
+impl hf_hub::api::Progress for Progress<'_> {
+    fn init(&mut self, size: usize, _filename: &str) {
+        self.total = size;
+        self.done = 0;
+    }
+    fn update(&mut self, size: usize) {
+        self.done += size;
+        if self.total > 20_000_000 {
+            (self.report)((self.done * 100 / self.total.max(1)).min(99) as u8);
         }
     }
-    let Some(names) = names else {
-        set_status(Status::NoOllama, shared);
-        return false;
+    fn finish(&mut self) {}
+}
+
+/// The model's files, downloading whichever are missing (progress 0–100).
+pub fn download(report: &mut dyn FnMut(u8)) -> Result<Vec<PathBuf>, String> {
+    let dir = models_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let cache = hf_hub::Cache::new(dir.clone()).model(EMBED_REPO.to_string());
+    let mut paths = Vec::new();
+    let mut api = None;
+    for f in EMBED_FILES {
+        if let Some(p) = cache.get(f) {
+            paths.push(p);
+            continue;
+        }
+        if api.is_none() {
+            let a = hf_hub::api::sync::ApiBuilder::new().with_cache_dir(dir.clone()).with_progress(false).build().map_err(|e| e.to_string())?;
+            api = Some(a.model(EMBED_REPO.to_string()));
+        }
+        let repo = api.as_ref().unwrap();
+        let p = repo
+            .download_with_progress(f, Progress { total: 0, done: 0, report: &mut *report })
+            .map_err(|e| format!("couldn't download {f}: {e}"))?;
+        paths.push(p);
+    }
+    report(100);
+    Ok(paths)
+}
+
+fn load(paths: &[PathBuf]) -> Result<fastembed::Bgem3Embedding, String> {
+    let read = |i: usize| std::fs::read(&paths[i]).map_err(|e| e.to_string());
+    let files = fastembed::TokenizerFiles {
+        config_file: read(0)?,
+        special_tokens_map_file: read(1)?,
+        tokenizer_config_file: read(2)?,
+        tokenizer_file: read(3)?,
     };
-    if has_model(&names, EMBED_MODEL) {
+    let model = fastembed::UserDefinedBgem3Model::new(read(4)?, files);
+    fastembed::Bgem3Embedding::try_new_from_user_defined(model, fastembed::InitOptionsUserDefined::default().with_max_length(1024))
+        .map_err(|e| e.to_string())
+}
+
+/// Makes sure bge-m3 is downloaded and loaded (downloading it the first time).
+pub fn ensure_embedder(shared: Option<&Shared>) -> bool {
+    if embedder().lock().unwrap().is_some() {
         set_status(Status::Ready, shared);
         return true;
     }
-    set_status(Status::Downloading(0), shared);
-    match pull(EMBED_MODEL, |p| set_status(Status::Downloading(p), shared)) {
-        Ok(()) => {
+    let mut report = |p: u8| set_status(Status::Downloading(p), shared);
+    let result = download(&mut report).and_then(|paths| load(&paths));
+    match result {
+        Ok(model) => {
+            *embedder().lock().unwrap() = Some(Embedder { model, used: std::time::Instant::now() });
             set_status(Status::Ready, shared);
             true
         }
@@ -253,18 +267,28 @@ pub fn ensure_embedder(shared: Option<&Shared>) -> bool {
     }
 }
 
-/// Unit-length embeddings (so similarity is a dot product).
+/// Frees the model's memory when it hasn't been used for a while.
+fn unload_if_idle() {
+    let mut e = embedder().lock().unwrap();
+    if e.as_ref().is_some_and(|m| m.used.elapsed() > IDLE_UNLOAD) {
+        *e = None;
+    }
+}
+
+/// Unit-length embeddings (so similarity is a dot product). Loads the model again if it was unloaded.
 pub fn embed(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Some(Vec::new());
     }
-    let v = post("/api/embed", &json!({ "model": EMBED_MODEL, "input": texts, "truncate": true }), Duration::from_secs(120)).ok()?;
-    let out: Vec<Vec<f32>> = v["embeddings"]
-        .as_array()?
-        .iter()
-        .map(|e| normalize(e.as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect()).unwrap_or_default()))
-        .collect();
-    (out.len() == texts.len() && out.iter().all(|e| !e.is_empty())).then_some(out)
+    if embedder().lock().unwrap().is_none() && (status() != Status::Ready || !ensure_embedder(None)) {
+        return None;
+    }
+    let mut guard = embedder().lock().unwrap();
+    let e = guard.as_mut()?;
+    e.used = std::time::Instant::now();
+    let out = e.model.embed(texts, Some(8)).ok()?.dense;
+    let out: Vec<Vec<f32>> = out.into_iter().map(normalize).collect();
+    (out.len() == texts.len() && out.iter().all(|v| !v.is_empty())).then_some(out)
 }
 
 fn normalize(mut v: Vec<f32>) -> Vec<f32> {
@@ -279,7 +303,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// The local chat model that keeps the notes: a fast one first.
+/// The local chat model that keeps the notes: a fast one first. None = no Ollama model (the note isn't updated).
 fn note_model(names: &[String]) -> Option<String> {
     const PREFER: [&str; 6] = ["gemma4", "gpt-oss:20b", "qwen3", "gemma", "gpt-oss", "llama"];
     let usable: Vec<&String> = names.iter().filter(|n| !n.contains("embed") && !n.starts_with("bge") && !n.starts_with("nomic") && !n.contains("minilm")).collect();
@@ -614,17 +638,19 @@ pub fn tick(shared: &Shared) {
     }
 }
 
-/// Background thread: sets up bge-m3 once (retrying if that fails), then keeps memory up to date every minute.
+/// Background thread: sets up bge-m3 once (retrying every 10 minutes if that fails), then keeps memory up to
+/// date every minute.
 pub fn start(shared: Arc<Shared>) {
     std::thread::spawn(move || {
         let mut tries = 0u32;
         loop {
-            let ready = status() == Status::Ready;
-            if !ready && shared.data.lock().unwrap().settings.memory && tries % 10 == 0 {
+            let on = shared.data.lock().unwrap().settings.memory;
+            if on && status() != Status::Ready && tries % 10 == 0 {
                 ensure_embedder(Some(&shared));
             }
             tries += 1;
             tick(&shared);
+            unload_if_idle();
             std::thread::sleep(Duration::from_secs(60));
         }
     });
@@ -675,8 +701,6 @@ mod tests {
     #[test]
     fn finds_installed_models() {
         let names = vec!["bge-m3:latest".to_string(), "gpt-oss:20b".into(), "gemma4:latest".into()];
-        assert!(has_model(&names, "bge-m3"));
-        assert!(!has_model(&names, "all-minilm"));
         assert_eq!(note_model(&names).as_deref(), Some("gemma4:latest"));
         assert_eq!(note_model(&["bge-m3:latest".to_string()]), None);
     }
@@ -689,7 +713,7 @@ mod tests {
         assert!(parse_response(err).unwrap_err().contains("not found"));
     }
 
-    /// Needs Ollama with bge-m3: cargo test -- --ignored live_recall
+    /// Downloads bge-m3 (once) and runs it in-process: cargo test -- --ignored live_recall --nocapture
     #[test]
     #[ignore]
     fn live_recall() {
@@ -707,21 +731,6 @@ mod tests {
         let hits = top(&index, &q, 100, 4);
         assert_eq!(hits.first().map(|h| h.1.text.contains("Netlify")), Some(true));
         assert!(!hits.iter().any(|h| h.1.text.contains("pizza")), "unrelated message recalled");
-    }
-}
-
-#[cfg(test)]
-mod live {
-    /// Downloads a small model the same way bge-m3 is downloaded: YH_TEST_PULL=all-minilm cargo test -- --ignored live_pull
-    #[test]
-    #[ignore]
-    fn live_pull() {
-        let model = std::env::var("YH_TEST_PULL").unwrap_or_else(|_| "all-minilm".into());
-        let mut seen = Vec::new();
-        super::pull(&model, |p| seen.push(p)).unwrap();
-        eprintln!("progress: {:?}", seen.iter().step_by((seen.len() / 12).max(1)).collect::<Vec<_>>());
-        assert_eq!(seen.last(), Some(&100));
-        assert!(super::has_model(&super::installed_models().unwrap(), &model));
     }
 }
 
@@ -760,6 +769,24 @@ mod live_note {
         eprintln!("{m} in {:.1}s:\n{note}", t.elapsed().as_secs_f32());
         assert!(note.contains("Astro") && note.contains("Tailwind"));
         assert!(!note.contains("sk-test-123"), "secret written to memory");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+#[cfg(test)]
+mod live_download {
+    /// Fresh download into a temp folder, with progress: cargo test -- --ignored live_download --nocapture
+    #[test]
+    #[ignore]
+    fn live_download() {
+        let tmp = std::env::temp_dir().join(format!("yh-dl-{}", crate::model::new_id()));
+        std::env::set_var("YH_DATA_FILE", tmp.join("state.json"));
+        let mut seen: Vec<u8> = Vec::new();
+        let paths = super::download(&mut |p| if seen.last() != Some(&p) { seen.push(p) }).unwrap();
+        eprintln!("progress: {:?}", seen.iter().step_by((seen.len() / 12).max(1)).collect::<Vec<_>>());
+        assert_eq!(paths.len(), 5);
+        assert_eq!(seen.last(), Some(&100));
+        assert!(seen.len() > 10, "progress should move in steps");
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

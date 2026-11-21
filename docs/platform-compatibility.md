@@ -51,7 +51,7 @@ Check channel switching, Team and channel menus, typing/Enter/Shift+Enter, micro
 
 ## CI preparation — 2026-11-21
 
-`.github/workflows/ci.yml` runs on pushes, pull requests, and manual dispatch. Its independent native jobs use macOS 26 ARM64, Ubuntu 24.04 x64, and Windows 2025 x64, Rust 1.86.0 (the declared minimum), and the checked-in Cargo.lock. Each job runs `cargo test --locked --all-targets` and `cargo build --locked --release`. No live model credentials are required. The Ollama integration test remains opt-in.
+`.github/workflows/ci.yml` runs on pushes, pull requests, and manual dispatch. Its independent native jobs use macOS 26 ARM64, Ubuntu 24.04 x64, and Windows 2025 x64, Rust 1.88.0 (the declared minimum), and the checked-in Cargo.lock. Each job runs `cargo test --locked --all-targets` and `cargo build --locked --release`. No live model credentials are required. The Ollama integration test remains opt-in.
 
 The macOS job additionally builds the Swift package helper, checks the app signature, and archives the ad-hoc-signed app. Linux archives the executable with its execute permission; Windows uploads the executable. These are development artifacts, not installers or verified releases. The Linux binary still depends on the target system's desktop libraries. Jobs use read-only repository permissions and do not publish releases or deploy anything.
 
