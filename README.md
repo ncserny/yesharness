@@ -36,7 +36,7 @@ hands it out to the specialists, then tells you how it went.
   channel (folder defaults to `~/Development/<name>`), opens it, and passes your request to the team there.
   It does this with action lines in its reply (`/new-channel`, `/send`, `/switch`) that the app carries out.
 - **Receipts, not promises:** under every agent reply the app shows what the turn actually did (commands run,
-  files edited, handoffs started), counted from the engines' own event streams (`codex exec --json`, Claude Code
+  files edited, handoffs started, tokens used), counted from the engines' own event streams (`codex exec --json`, Claude Code
   `stream-json`), not from what the agent says. If a reply claims work but nothing happened, it's marked "No action
   taken", and the agent is sent back once to do it for real. The main agent also gets these facts every turn, so it
   can't report imaginary progress. Handoffs count whether written as `@developer: …` or `@developer, …` at the start
@@ -74,9 +74,9 @@ hands it out to the specialists, then tells you how it went.
 - **No runaway agents:** every agent run has a small watchdog. If the app quits, crashes or is force-quit,
   the run is stopped within a couple of seconds.
 - **Speech engine** (Settings → Voice → Recognition):
-  - **Apple** (default): built into macOS (`SpeechAnalyzer` on macOS 26+). Live text as you speak, nothing to
+  - **Apple**: built into macOS (`SpeechAnalyzer` on macOS 26+). Live text as you speak, nothing to
     download, and agent and channel names are given as vocabulary hints.
-  - **Parakeet Ultra**: NVIDIA's Parakeet TDT (moondream's "Ultra" post-training) running on the Neural Engine
+  - **Parakeet Ultra** (default): NVIDIA's Parakeet TDT (moondream's "Ultra" post-training) running on the Neural Engine
     through [FluidAudio](https://github.com/FluidInference/FluidAudio). One-time setup of about 0.7 GB. Apple stays
     in use until it's ready. In a five-clip test it made half as many mistakes as Apple's recognizer (2.2% vs 4.5%
     words wrong), at a similar speed (~0.5 s per sentence). Live text comes from re-transcribing about every 0.6 s.

@@ -28,6 +28,17 @@ pub struct Receipt {
     pub edited: Vec<String>,
     /// Reads, searches, web lookups, other tools.
     pub lookups: usize,
+    /// Tokens the engine reported for this turn (input incl. cached + output): what eats your quota.
+    pub tokens: u64,
+}
+
+/// "140k tokens" / "2.9M tokens"
+pub fn tokens_label(t: u64) -> String {
+    if t >= 1_000_000 {
+        format!("{:.1}M tokens", t as f64 / 1e6)
+    } else {
+        format!("{}k tokens", (t + 500) / 1000)
+    }
 }
 
 impl Receipt {
@@ -59,6 +70,9 @@ impl Receipt {
             0 => {}
             1 => parts.push("1 lookup".to_string()),
             n => parts.push(format!("{n} lookups")),
+        }
+        if self.tokens > 0 {
+            parts.push(tokens_label(self.tokens));
         }
         parts.join(" · ")
     }
@@ -181,6 +195,9 @@ impl ClaudeParser {
                     }
                 }
                 self.denied = v["permission_denials"].as_array().map(|a| a.len()).unwrap_or(0);
+                let u = &v["usage"];
+                let n = |k: &str| u[k].as_u64().unwrap_or(0);
+                self.receipt.tokens = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens") + n("output_tokens");
                 None
             }
             _ => None,
@@ -303,6 +320,13 @@ impl CodexParser {
                     "todo_list" => Some("planning".into()),
                     _ => None,
                 }
+            }
+            "turn.completed" => {
+                let u = &v["usage"];
+                let n = |k: &str| u[k].as_u64().unwrap_or(0);
+                // input_tokens already includes the cached part
+                self.receipt.tokens += n("input_tokens") + n("output_tokens") + n("reasoning_output_tokens");
+                None
             }
             "turn.failed" => {
                 self.error = Some(clean_error(v["error"]["message"].as_str().unwrap_or("Codex failed")));
@@ -549,6 +573,8 @@ mod tests {
         c.feed(r#"{"type":"item.completed","item":{"type":"command_execution","command":"cargo test"}}"#);
         c.feed(r#"{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"/p/src/ui.rs","kind":"update"},{"path":"/p/README.md","kind":"add"}]}}"#);
         assert_eq!(c.receipt.summary(), "ran 1 command · edited ui.rs, README.md");
+        c.feed(r#"{"type":"turn.completed","usage":{"input_tokens":139500,"cached_input_tokens":120000,"output_tokens":800}}"#);
+        assert_eq!(c.receipt.summary(), "ran 1 command · edited ui.rs, README.md · 140k tokens");
         assert!(c.receipt.did_work());
 
         let mut cl = ClaudeParser::default();

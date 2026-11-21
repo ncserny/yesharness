@@ -206,12 +206,13 @@ pub struct Settings {
     #[serde(default = "auto_theme")]
     pub theme: String,
     /// Speech recognition: "apple" (built in) or "parakeet" (Parakeet Ultra, downloaded once).
-    #[serde(default = "apple_engine")]
+    #[serde(default = "default_engine")]
     pub stt_engine: String,
 }
 
-fn apple_engine() -> String {
-    "apple".into()
+/// Parakeet Ultra by default: clearly more accurate. Apple's recognizer is used until it's set up.
+fn default_engine() -> String {
+    "parakeet".into()
 }
 
 fn auto_theme() -> String {
@@ -231,7 +232,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: apple_engine() }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine() }
     }
 }
 
