@@ -51,6 +51,8 @@ pub struct App {
     new_channel: Option<NewChannel>,
     renaming: Option<String>,
     about: Option<AboutYou>,
+    /// When you last typed (always-listening ignores the mic meanwhile: keyboard clicks aren't speech).
+    last_typed: Option<Instant>,
     /// The first-run welcome (Alex asks a few questions out loud).
     welcome: Option<crate::welcome::Welcome>,
     /// Slide-out on the right: a file (TASKS.md, AGENTS.md) or the docs folder.
@@ -234,6 +236,7 @@ impl App {
             new_channel: None,
             renaming: None,
             about: None,
+            last_typed: None,
             welcome: None,
             panel: None,
             last_save: Instant::now(),
@@ -458,10 +461,13 @@ impl App {
         }
 
         // Hands-free: each pause delivers an utterance.
+        // You're typing: what the mic hears now is keys clicking, not you talking to the team.
+        let typing = self.last_typed.is_some_and(|t| t.elapsed() < Duration::from_millis(2500));
         for u in st.utterances.drain(..) {
             let u = u.trim().to_string();
-            if std::mem::take(&mut self.skip_next_utterance) || u.is_empty() || voice::is_echo(&u) {
-                // Already sent from the text box, or our own read-aloud voice.
+            let noise = self.welcome.is_none() && (voice::is_noise(&u) || (typing && mode == Mode::HandsFree));
+            if std::mem::take(&mut self.skip_next_utterance) || u.is_empty() || noise || voice::is_echo(&u) {
+                // Already sent from the text box, our own read-aloud voice, or just a sound.
                 if keyboard {
                     self.live = None;
                 }
@@ -578,6 +584,9 @@ impl eframe::App for App {
             p.rect(card, 16.0, t.bg, Stroke::new(2.0_f32, t.accent), egui::StrokeKind::Inside);
             p.text(card.center() - vec2(0.0, 12.0), Align2::CENTER_CENTER, "Drop to attach", FontId::proportional(17.0), t.strong);
             p.text(card.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, "Goes with your next message", FontId::proportional(12.5), t.secondary);
+        }
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Key { pressed: true, .. }))) {
+            self.last_typed = Some(Instant::now());
         }
         if self.welcome_ui(ctx) {
             return;

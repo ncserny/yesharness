@@ -467,6 +467,25 @@ pub fn is_echo(utterance: &str) -> bool {
     sounds_like_us(utterance)
 }
 
+/// Not something you said to the team: a sound, a filler, or a fragment ("Sh", "Hmm", "Uh-huh").
+/// Single words count only if they're a clear answer ("yes", "stop") or a real word of 5+ letters (a name).
+pub fn is_noise(utterance: &str) -> bool {
+    let w = words(utterance);
+    const FILLER: [&str; 16] = ["sh", "shh", "hmm", "hm", "mm", "mhm", "uh", "um", "ah", "oh", "eh", "huh", "psst", "ahh", "ohh", "uhh"];
+    const ANSWERS: [&str; 20] = [
+        "yes", "no", "stop", "okay", "ok", "continue", "thanks", "sure", "wait", "go", "quiet", "cancel", "ja", "nein", "done",
+        "next", "yeah", "nope", "right", "hi",
+    ];
+    if w.iter().all(|x| FILLER.contains(&x.as_str())) {
+        return true; // also catches "" and "Sh."
+    }
+    if w.len() == 1 {
+        let x = w[0].as_str();
+        return !(ANSWERS.contains(&x) || x.chars().count() >= 5);
+    }
+    false
+}
+
 /// You talking over an agent (not its voice leaking through): stop it and listen.
 pub fn interrupts(partial: &str) -> bool {
     barge_in() && speaking() && is_interruption(partial)
@@ -664,6 +683,13 @@ mod tests {
         assert!(!super::is_echo("Write a blog post about voice agents"));
         assert!(!super::is_echo("Yes"));
         // Talking over an agent: your words interrupt, its own words leaking through don't.
+        // Noise while always listening (typing, a cough) isn't sent.
+        assert!(super::is_noise("Sh."));
+        assert!(super::is_noise("Hmm"));
+        assert!(super::is_noise("the"));
+        assert!(!super::is_noise("Yes."));
+        assert!(!super::is_noise("Kunsthalle."), "a name on its own is fine");
+        assert!(!super::is_noise("Thank you."));
         assert!(super::is_interruption("wait, actually"));
         assert!(super::is_interruption("Stop"));
         assert!(!super::is_interruption("um"));
