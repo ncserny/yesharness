@@ -54,6 +54,8 @@ pub struct App {
     eleven_key: String,
     eleven_note: Option<String>,
     about: Option<AboutYou>,
+    /// The first-run welcome (Alex asks a few questions out loud).
+    welcome: Option<crate::welcome::Welcome>,
     /// Slide-out on the right: a file (TASKS.md, AGENTS.md) or the docs folder.
     panel: Option<Panel>,
     last_save: Instant,
@@ -233,6 +235,7 @@ impl App {
             eleven_key: String::new(),
             eleven_note: None,
             about: None,
+            welcome: None,
             panel: None,
             last_save: Instant::now(),
             focus_input: false,
@@ -279,6 +282,75 @@ impl App {
             }
             Err(e) => self.voice_error = Some(e),
         }
+    }
+
+    fn new_welcome(&self) -> crate::welcome::Welcome {
+        let langs = self.shared.data.lock().unwrap().settings.languages.clone();
+        let langs = if langs.is_empty() { system_languages() } else { langs };
+        let name = std::process::Command::new("id").arg("-F").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        crate::welcome::Welcome::new(name, langs, &model::projects_dir())
+    }
+
+    /// The welcome screen, instead of the normal window, until it's done. Returns true while it shows.
+    fn welcome_ui(&mut self, ctx: &egui::Context) -> bool {
+        let first_run = {
+            let d = self.shared.data.lock().unwrap();
+            !d.settings.onboarded && (std::env::var_os("YH_SCREENSHOT").is_none() || std::env::var_os("YH_SHOW_ONBOARDING").is_some())
+        };
+        if self.welcome.is_none() && first_run {
+            self.welcome = Some(self.new_welcome());
+        }
+        if self.welcome.is_none() {
+            return false;
+        }
+        // Listen for answers even if you normally use push-to-talk.
+        if self.dictation.is_none() && self.voice_error.is_none() {
+            self.start_voice(Mode::HandsFree, ctx);
+        }
+        let answers = self.poll_voice(ctx);
+        let (live, level) = self.dictation.as_ref().map(|d| {
+            let s = d.state.lock().unwrap();
+            (s.text.clone(), s.level)
+        }).unwrap_or_default();
+        let (alex_color, alex_voice) = {
+            let d = self.shared.data.lock().unwrap();
+            let idx = d.agents.iter().position(|a| a.handle == "main").unwrap_or(0);
+            d.agents.get(idx).map(|a| (color(a.color), voice::agent_voice(idx, &a.voice, &a.eleven_voice))).unwrap_or((Color32::from_rgb(232, 104, 74), String::new()))
+        };
+        let w = self.welcome.as_mut().unwrap();
+        for a in answers {
+            w.hear(&a);
+        }
+        if let Some(q) = w.take_question_to_speak() {
+            if std::env::var_os("YH_SCREENSHOT").is_none() {
+                voice::stop_speaking();
+                voice::speak(&q, &alex_voice);
+            }
+        }
+        let outcome = w.show(ctx, &live, level, voice::speaking(), alex_color);
+        let finished = !matches!(outcome, crate::welcome::Outcome::Continue);
+        let mut data = self.shared.data.lock().unwrap();
+        match outcome {
+            crate::welcome::Outcome::Finished(note, langs) => {
+                let _ = crate::memory::write_you(&note);
+                data.settings.languages = langs;
+                data.settings.onboarded = true;
+            }
+            crate::welcome::Outcome::Skipped => data.settings.onboarded = true,
+            crate::welcome::Outcome::Continue => {}
+        }
+        let hands_free = data.settings.hands_free;
+        drop(data);
+        if finished {
+            self.welcome = None;
+            voice::stop_speaking();
+            self.shared.dirty.store(true, Ordering::Relaxed);
+            if !hands_free {
+                self.dictation = None; // back to push-to-talk
+            }
+            let _ = model::save(&self.shared.data.lock().unwrap());
+        }
+        true
     }
 
     /// What always-listening was started with; a change restarts it.
@@ -502,6 +574,9 @@ impl eframe::App for App {
             p.rect(card, 16.0, t.bg, Stroke::new(2.0_f32, t.accent), egui::StrokeKind::Inside);
             p.text(card.center() - vec2(0.0, 12.0), Align2::CENTER_CENTER, "Drop to attach", FontId::proportional(17.0), t.strong);
             p.text(card.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, "Goes with your next message", FontId::proportional(12.5), t.secondary);
+        }
+        if self.welcome_ui(ctx) {
+            return;
         }
         let to_send = self.poll_voice(ctx);
         let voice_state = self.dictation.as_ref().map(|d| (d.mode, d.stopping(), d.state.lock().unwrap().clone()));
@@ -2047,11 +2122,16 @@ impl App {
                 self.toggle_hands_free(ctx);
             }
             if let Some(saved) = open_about {
-                // Edit the note as text once it exists; otherwise ask the questions.
+                // Edit the note as text once it exists; otherwise Alex asks the questions again.
                 let langs = shared.data.lock().unwrap().settings.languages.clone();
-                let mut a = AboutYou::new(&langs);
-                a.raw = saved;
-                self.about = Some(a);
+                match saved {
+                    Some(text) => {
+                        let mut a = AboutYou::new(&langs);
+                        a.raw = Some(text);
+                        self.about = Some(a);
+                    }
+                    None => self.welcome = Some(self.new_welcome()),
+                }
                 done = true;
             }
             if done || resp.should_close() {
@@ -2065,10 +2145,7 @@ impl App {
             let d = shared.data.lock().unwrap();
             !d.settings.onboarded && (std::env::var_os("YH_SCREENSHOT").is_none() || std::env::var_os("YH_SHOW_ONBOARDING").is_some())
         };
-        if first_run && self.about.is_none() && !self.show_settings && self.new_channel.is_none() {
-            let langs = shared.data.lock().unwrap().settings.languages.clone();
-            self.about = Some(AboutYou::new(&langs));
-        }
+        let _ = first_run; // the welcome screen handles the first run (see update)
         if self.about.is_some() {
             let mut save = false;
             let mut skip = false;

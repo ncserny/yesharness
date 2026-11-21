@@ -14,6 +14,7 @@ mod project;
 mod theme;
 mod ui;
 mod voice;
+mod welcome;
 
 fn main() -> eframe::Result<()> {
     env::init();
