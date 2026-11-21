@@ -583,7 +583,7 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         let prompt = with_memory(prompt, cid, true, &router_recall, shared);
         let model = probe::pick_model(&eff, shared.health_of(&eff).as_ref());
         shared.set_status(cid, &agent.handle, "thinking…".into());
-        let r = agents::run_router(&folder, &prompt, model.as_deref(), &ctl);
+        let r = agents::run_router(&folder, &prompt, model.as_deref(), eff.internet, &ctl);
         if cancel.load(Ordering::Relaxed) {
             shared.done_working(cid, &agent.handle);
             return;
@@ -696,7 +696,8 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         t.tokens += out.receipt.tokens;
         t.tokens > TOKEN_BUDGET
     };
-    let idle_claim = !out.error && !out.receipt.did_work() && delegates.is_empty() && actions.is_empty() && claims_work(&shown, &members);
+    // An agent that tried something and was blocked isn't making empty promises: it already says why.
+    let idle_claim = !out.error && !out.receipt.did_work() && out.receipt.blocked == 0 && delegates.is_empty() && actions.is_empty() && claims_work(&shown, &members);
 
     let to_user = matches!(mode, Mode::User | Mode::FollowUp | Mode::Nudge) && !out.error;
     if matches!(mode, Mode::User) && !out.error {
@@ -1269,7 +1270,7 @@ pub fn claims_work(text: &str, members: &[Agent]) -> bool {
         "i'll ", "i will ", "on it", "right away", "i'm starting", "starting now", "i'm on ", "i'm going to",
         "i've created", "i've added", "i've updated", "i've fixed", "i've changed", "i have created", "i have updated",
         "i fixed", "i created", "i updated", "working on it", "dive into", "diving into", "will start", "kick off",
-        "is working on", "are working on", "has started", "have started", "i've asked", "i asked",
+        "is working on it", "are working on it", "has started on", "have started on", "i've asked", "i asked",
     ];
     if PHRASES.iter().any(|p| t.contains(p)) {
         return true;
@@ -1458,6 +1459,9 @@ mod tests {
         assert!(claims_work("Got it—I'll dive into the Windows test failure right away.", &m));
         assert!(claims_work("I asked @developer to look at it.", &m));
         assert!(!claims_work("A harness is the software around an AI.", &m));
+        // Facts about the world aren't promises (the reply from the Turin screenshot).
+        assert!(!claims_work("In past years the two semis have started around early afternoon, Turin time.", &m));
+        assert!(claims_work("The developer is working on it now.", &m));
         assert!(!claims_work("Sure, let me know which file.", &m));
     }
 
