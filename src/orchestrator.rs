@@ -589,7 +589,7 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         let data = shared.data.lock().unwrap();
         let Some(ch) = data.channel(cid) else { return };
         let idx = data.agents.iter().position(|a| a.id == agent.id).unwrap_or(0);
-        let voice_name = voice::agent_voice(idx, &agent.voice, &agent.eleven_voice);
+        let voice_name = voice::agent_voice(idx, &agent.voice, &agent.local_voice);
         (data.members(ch), PathBuf::from(&ch.folder), ch.sessions.clone(), data.settings.read_aloud, voice_name)
     };
     if !folder.is_dir() {
@@ -1381,6 +1381,11 @@ pub fn claims_work(text: &str, members: &[Agent]) -> bool {
         "i fixed", "i created", "i updated", "working on it", "dive into", "diving into", "will start", "kick off",
         "is working on it", "are working on it", "has started on", "have started on", "i've asked", "i asked",
     ];
+    // Saying there's nothing to do isn't a promise ("Nothing here needs me, so I'll stay quiet").
+    const NOTHING: [&str; 8] = ["nothing", "no work", "don't need", "not needed", "stay quiet", "until you", "no action", "nobody has asked"];
+    if NOTHING.iter().any(|n| t.contains(n)) {
+        return false;
+    }
     if PHRASES.iter().any(|p| t.contains(p)) {
         return true;
     }
@@ -1496,7 +1501,7 @@ mod tests {
             description: String::new(),
             briefing: String::new(),
             voice: String::new(),
-            eleven_voice: String::new(),
+            local_voice: String::new(),
             effort: String::new(),
             use_my_plugins: false,
             internet: true,
@@ -1582,6 +1587,7 @@ mod tests {
         // Facts about the world aren't promises (the reply from the Turin screenshot).
         assert!(!claims_work("In past years the two semis have started around early afternoon, Turin time.", &m));
         assert!(claims_work("The developer is working on it now.", &m));
+        assert!(!claims_work("Nothing here needs me, so I'll stay quiet until you want a blog post written.", &m));
         // Waiting on the user, not an empty promise (a real reply).
         assert!(asks_user("Send me a link, or give the agents access to its folder, and I'll review it."));
         assert!(!asks_user("On it, I'll start right away."));

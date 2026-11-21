@@ -129,10 +129,10 @@ straight from the folder (no `git` needed), refreshed every minute and after eac
 - **Interrupt by talking (on by default):** in always-listening mode the app keeps listening while agents talk.
   Apple's echo cancellation removes their voices from the microphone, so when you speak (or just say "stop"),
   the agent stops and listens.
-- **ElevenLabs voices (optional):** Settings → Voice → Voices → ElevenLabs, then paste your API key (stored in the
-  macOS Keychain, not in YesHarness's files). Pick a voice per agent under Team. Replies are read sentence by
-  sentence, so speech starts quickly. If the key is wrong, credits run out or you're offline, the Apple voice
-  takes over. Each reply read aloud uses your ElevenLabs credits (replies are capped at 1,500 characters).
+- **Natural voices on your Mac (default):** replies are read with Kokoro-82M (English, Apache-2.0, ~90 MB) or
+  Kyutai Pocket TTS (German, French, Italian, Portuguese), running locally on the Neural Engine through FluidAudio:
+  no account, no cloud, no cost. Pick a voice per agent under Team. Replies are read sentence by sentence, so
+  speech starts quickly; other languages or errors fall back to the Apple voice. Settings → Voice → Voices.
 
 ### About you
 The first time you start the app it asks a few questions: your name, what you do, the languages you speak, how
@@ -210,7 +210,7 @@ YH_LEAD=codex YH_CODEX_MODEL=gpt-6-sol target/release/yesharness --ask "hi" "wha
 - `src/heartbeat.rs`: the 1-minute watcher for AGENTS.md / TASKS.md / docs
 - `src/inbox.rs`: `--send` / `--new-channel` control of the running app
 - `src/memory.rs`: long-term memory per channel (note kept by a local model, in-app bge-m3 recall)
-- `src/elevenlabs.rs`: optional ElevenLabs voices (Keychain key, voice list, speech)
+- `src/localvoice.rs` + `helper/Sources/yh-dictate/Speak.swift`: natural voices on your Mac (Kokoro, Pocket TTS)
 - `src/voice.rs` + `helper/dictate.swift`: speech-to-text (push-to-talk, hands-free) and reading replies aloud
 
 Test the speech engine without a microphone:

@@ -50,9 +50,6 @@ pub struct App {
     team_sel: Option<String>,
     new_channel: Option<NewChannel>,
     renaming: Option<String>,
-    /// ElevenLabs API key being typed in Settings (moved to the Keychain on Save, then cleared).
-    eleven_key: String,
-    eleven_note: Option<String>,
     about: Option<AboutYou>,
     /// The first-run welcome (Alex asks a few questions out loud).
     welcome: Option<crate::welcome::Welcome>,
@@ -196,6 +193,10 @@ impl App {
         heartbeat::start(shared.clone());
         crate::inbox::start(shared.clone());
         crate::memory::start(shared.clone());
+        // Get the natural voice ready, so the first reply doesn't wait for it.
+        if shared.data.lock().unwrap().settings.voice_engine == "local" && std::env::var_os("YH_SCREENSHOT").is_none() {
+            std::thread::spawn(crate::localvoice::start);
+        }
         voice::prepare();
         if shared.data.lock().unwrap().settings.stt_engine == "parakeet" {
             let c = ctx.clone();
@@ -232,8 +233,6 @@ impl App {
             team_sel: None,
             new_channel: None,
             renaming: None,
-            eleven_key: String::new(),
-            eleven_note: None,
             about: None,
             welcome: None,
             panel: None,
@@ -315,7 +314,7 @@ impl App {
         let (alex_color, alex_voice) = {
             let d = self.shared.data.lock().unwrap();
             let idx = d.agents.iter().position(|a| a.handle == "main").unwrap_or(0);
-            d.agents.get(idx).map(|a| (color(a.color), voice::agent_voice(idx, &a.voice, &a.eleven_voice))).unwrap_or((Color32::from_rgb(232, 104, 74), String::new()))
+            d.agents.get(idx).map(|a| (color(a.color), voice::agent_voice(idx, &a.voice, &a.local_voice))).unwrap_or((Color32::from_rgb(232, 104, 74), String::new()))
         };
         let w = self.welcome.as_mut().unwrap();
         for a in answers {
@@ -524,6 +523,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// The window's own background shows through between panels; make it ours, not near-black.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.shutdown();
     }
@@ -613,11 +617,7 @@ impl eframe::App for App {
             }
         }
         voice::set_speed(data.settings.speech_speed);
-        voice::set_engine(data.settings.tts_engine == "elevenlabs");
-        if data.settings.tts_engine == "elevenlabs" {
-            let c = ctx.clone();
-            crate::elevenlabs::load_voices(move || c.request_repaint());
-        }
+        voice::set_engine(data.settings.voice_engine == "local");
         if self.applied_theme != data.settings.theme && std::env::var_os("YH_THEME").is_none() {
             self.applied_theme = data.settings.theme.clone();
             ctx.set_theme(match self.applied_theme.as_str() {
@@ -657,15 +657,27 @@ impl eframe::App for App {
             .map(|(k, r)| (k.clone(), (r.working.clone(), r.started.elapsed().as_secs(), r.queue.len())))
             .collect();
 
-        // ------------------------------------------------ sidebar
+        // ------------------------------------------------ sidebar (Ctrl+Cmd+S or the sidebar button hides it)
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::COMMAND, Key::S)) {
+            data.settings.sidebar_hidden = !data.settings.sidebar_hidden;
+            shared.dirty.store(true, Ordering::Relaxed);
+        }
+        let sidebar_shown = !data.settings.sidebar_hidden;
+        let mut toggle_sidebar = false;
+        let mut toggle_team = false;
         egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(236.0)
             .width_range(200.0..=320.0)
             .frame(Frame::new().fill(t.sidebar).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
-            .show(ctx, |ui| {
+            .show_animated(ctx, sidebar_shown, |ui| {
                 let top = Rect::from_min_size(ui.max_rect().min, vec2(ui.available_width(), TITLEBAR));
                 window_drag(ui, top, "sidebar-drag");
+                // Hide button, top right (the traffic lights are on the left).
+                let b = Rect::from_center_size(egui::pos2(top.right() - 12.0, top.top() + 19.0), Vec2::splat(24.0));
+                if ui.put(b, |ui: &mut egui::Ui| icon_button(ui, &t, Icon::Sidebar, 24.0, false, "Hide sidebar (Ctrl+Cmd+S)")).clicked() {
+                    toggle_sidebar = true;
+                }
                 ui.add_space(TITLEBAR);
 
                 ui.horizontal(|ui| {
@@ -680,7 +692,7 @@ impl eframe::App for App {
                         }
                     });
                 });
-                let team_h = 70.0 + data.agents.len() as f32 * 40.0;
+                let team_h = 70.0 + if data.settings.team_collapsed { 0.0 } else { data.agents.len() as f32 * 40.0 };
                 ScrollArea::vertical()
                     .id_salt("channels")
                     .auto_shrink([false, true])
@@ -722,17 +734,44 @@ impl eframe::App for App {
                         }
                     });
                     ui.add_space(2.0);
-                    for a in data.agents.iter().rev() {
-                        let (line, col, tip) = role_status(a, &health, &t);
-                        if agent_row(ui, &t, a, &line, col).on_hover_text(tip).clicked() {
-                            self.team_sel = Some(a.id.clone());
-                            self.show_team = true;
+                    let collapsed = data.settings.team_collapsed;
+                    if collapsed {
+                        // Folded: just the faces, side by side.
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            for a in &data.agents {
+                                let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                                icons::avatar(ui.painter(), r.center(), 10.0, color(a.color), a.name().chars().next().unwrap_or('?'));
+                                let (line, _, _) = role_status(a, &health, &t);
+                                if resp.on_hover_text(format!("{} · {line}", a.name())).clicked() {
+                                    self.team_sel = Some(a.id.clone());
+                                    self.show_team = true;
+                                }
+                            }
+                        });
+                    } else {
+                        for a in data.agents.iter().rev() {
+                            let (line, col, tip) = role_status(a, &health, &t);
+                            if agent_row(ui, &t, a, &line, col).on_hover_text(tip).clicked() {
+                                self.team_sel = Some(a.id.clone());
+                                self.show_team = true;
+                            }
                         }
                     }
                     ui.add_space(4.0);
-                    section_label(ui, &t, "Team");
+                    if fold_label(ui, &t, "Your team", collapsed).clicked() {
+                        toggle_team = true;
+                    }
                 });
             });
+        if toggle_sidebar {
+            data.settings.sidebar_hidden = !data.settings.sidebar_hidden;
+            shared.dirty.store(true, Ordering::Relaxed);
+        }
+        if toggle_team {
+            data.settings.team_collapsed = !data.settings.team_collapsed;
+            shared.dirty.store(true, Ordering::Relaxed);
+        }
 
         let Some(cid) = selected.clone() else {
             egui::CentralPanel::default().frame(Frame::new().fill(t.bg)).show(ctx, |ui| {
@@ -848,7 +887,7 @@ impl eframe::App for App {
                                 .id(id)
                                 .frame(false)
                                 .font(FontId::proportional(14.0))
-                                .hint_text(RichText::new(format!("Message #{channel_name}   (Shift+Enter for a new line)")).color(t.tertiary))
+                                .hint_text(RichText::new(format!("Talk to me, or type here…   (#{channel_name})")).color(t.tertiary))
                                 .desired_rows(1)
                                 .desired_width(middle_w),
                         );
@@ -939,14 +978,29 @@ impl eframe::App for App {
         // ------------------------------------------------ header
         egui::TopBottomPanel::top("header")
             .exact_height(62.0)
+            .resizable(false)
+            .show_separator_line(false)
             .frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 0)))
             .show(ctx, |ui| {
+                // A soft hairline instead of the hard panel edge.
+                let edge = ui.max_rect();
+                ui.painter().hline(edge.left() - 20.0..=edge.right() + 20.0, edge.bottom() - 0.5, Stroke::new(1.0_f32, t.separator));
                 window_drag(ui, ui.max_rect(), "header-drag");
+                let sidebar_hidden = data.settings.sidebar_hidden;
+                let mut show_sidebar = false;
                 let memory_on = data.settings.memory;
                 let Data { agents, channels, selected, .. } = &mut *data;
                 let Some(idx) = channels.iter().position(|c| c.id == cid) else { return };
                 let mut delete = false;
                 ui.horizontal_centered(|ui| {
+                    if sidebar_hidden {
+                        // Room for the window buttons, then the button that brings the sidebar back.
+                        ui.add_space(if cfg!(target_os = "macos") { 56.0 } else { 0.0 });
+                        if icon_button(ui, &t, Icon::Sidebar, 26.0, false, "Show sidebar (Ctrl+Cmd+S)").clicked() {
+                            show_sidebar = true;
+                        }
+                        ui.add_space(6.0);
+                    }
                     let ch = &mut channels[idx];
                     ui.vertical(|ui| {
                     ui.add_space(9.0);
@@ -963,7 +1017,7 @@ impl eframe::App for App {
                             self.renaming = None;
                         }
                     } else {
-                        ui.label(RichText::new(&ch.name).size(15.5).color(t.strong));
+                        ui.label(RichText::new(&ch.name).font(FontId::new(18.0, egui::FontFamily::Name("serif".into()))).color(t.strong));
                     }
                     let folder = ui
                         .add(egui::Label::new(RichText::new(short_path(&ch.folder)).size(12.0).color(t.tertiary)).sense(Sense::click()))
@@ -1071,11 +1125,21 @@ impl eframe::App for App {
                     shared.dirty.store(true, Ordering::Relaxed);
                     actions.push(Action::Stop(cid.clone()));
                 }
+                if show_sidebar {
+                    data.settings.sidebar_hidden = false;
+                    shared.dirty.store(true, Ordering::Relaxed);
+                }
             });
 
         // ------------------------------------------------ conversation
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg)).show(ctx, |ui| {
             let Some(ch) = data.channel(&cid) else { return };
+            // A little warm light in the room.
+            let room = ui.max_rect();
+            let glow = if t.dark { 26 } else { 34 };
+            crate::welcome::soft_circle(ui.painter(), room.right_top() + vec2(-room.width() * 0.15, room.height() * 0.1), room.width() * 0.45, Color32::from_rgba_unmultiplied(255, 170, 130, glow));
+            crate::welcome::soft_circle(ui.painter(), room.left_bottom() + vec2(room.width() * 0.1, -room.height() * 0.05), room.width() * 0.4, Color32::from_rgba_unmultiplied(246, 160, 196, glow - 8));
+            let lead = data.members(ch).into_iter().next();
             ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 let full = ui.available_width();
                 let w = (full - 48.0).min(740.0);
@@ -1084,12 +1148,32 @@ impl eframe::App for App {
                     ui.vertical(|ui| {
                         ui.set_width(w);
                         ui.add_space(12.0);
-                        if ch.messages.is_empty() {
-                            ui.add_space(80.0);
+                        // Your pal says hello at the top of every conversation.
+                        {
+                            let empty = ch.messages.is_empty();
+                            if empty {
+                                ui.add_space(70.0);
+                            }
+                            let (name, color_of, initial) = lead
+                                .as_ref()
+                                .map(|a| (a.name().to_string(), color(a.color), a.name().chars().next().unwrap_or('A')))
+                                .unwrap_or_else(|| ("Alex".into(), t.accent, 'A'));
+                            let size = if empty { 34.0 } else { 22.0 };
                             ui.vertical_centered(|ui| {
-                                ui.label(RichText::new("Just start talking.").size(20.0).color(t.strong));
-                                ui.label(RichText::new("The main agent listens and brings in the team.").color(t.secondary));
+                                let (r, _) = ui.allocate_exact_size(vec2(size * 4.0, size * 2.6), Sense::hover());
+                                let time = ui.input(|i| i.time) as f32;
+                                let talking = if voice::speaking() { 1.0 } else { 0.0 };
+                                crate::welcome::orb(ui.painter(), r.center(), size, color_of, t.accent, time, talking, 0.0, initial);
+                                let you = crate::memory::your_name().map(|n| format!(", {n}")).unwrap_or_default();
+                                ui.label(RichText::new(format!("{}{you}.", greeting())).font(FontId::new(if empty { 28.0 } else { 21.0 }, egui::FontFamily::Name("serif".into()))).color(t.strong));
+                                let line = if empty {
+                                    format!("I'm {name}. Tell me what you need, and I'll take care of it with the team.")
+                                } else {
+                                    format!("{name} is here whenever you need anything. Just talk.")
+                                };
+                                ui.label(RichText::new(line).size(13.0).color(t.secondary));
                             });
+                            ui.add_space(if empty { 0.0 } else { 18.0 });
                         }
                         // Long conversations stay fast: only the latest messages are laid out.
                         const RECENT: usize = 150;
@@ -1189,6 +1273,7 @@ impl App {
             orchestrator::stop(&self.shared, &id);
         }
         voice::stop_speaking();
+        crate::localvoice::stop();
         self.dictation = None;
         self.save_if_needed(true);
     }
@@ -1221,6 +1306,18 @@ fn window_drag(ui: &mut egui::Ui, rect: Rect, id: &str) {
         let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
     }
+}
+
+/// A section title you can click to fold the section away (a small chevron shows which way).
+fn fold_label(ui: &mut egui::Ui, t: &Theme, text: &str, folded: bool) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.0), t.tertiary);
+    let (r, resp) = ui.allocate_exact_size(vec2(galley.size().x + 18.0, 18.0), Sense::click());
+    let col = if resp.hovered() { t.secondary } else { t.tertiary };
+    ui.painter().galley(egui::pos2(r.left(), r.center().y - galley.size().y / 2.0), galley, col);
+    let c = egui::pos2(r.right() - 6.0, r.center().y);
+    let pts = if folded { vec![c + vec2(-2.0, -3.5), c + vec2(2.0, 0.0), c + vec2(-2.0, 3.5)] } else { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.5), c + vec2(3.5, -1.5)] };
+    ui.painter().add(egui::Shape::line(pts, Stroke::new(1.3_f32, col)));
+    resp.on_hover_text(if folded { "Show your team" } else { "Fold away" })
 }
 
 fn section_label(ui: &mut egui::Ui, t: &Theme, text: &str) {
@@ -1650,6 +1747,22 @@ fn store_attachments(folder: &str, files: &[std::path::PathBuf]) -> Vec<String> 
         .collect()
 }
 
+/// "Good morning" / "Good afternoon" / "Good evening", by the clock on your Mac.
+fn greeting() -> &'static str {
+    static HOUR: std::sync::Mutex<Option<(Instant, u32)>> = std::sync::Mutex::new(None);
+    let mut h = HOUR.lock().unwrap();
+    if h.is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(300)) {
+        let hour = std::process::Command::new("date").arg("+%H").output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(12);
+        *h = Some((Instant::now(), hour));
+    }
+    match h.map(|(_, hr)| hr).unwrap_or(12) {
+        5..=11 => "Good morning",
+        12..=17 => "Good afternoon",
+        18..=22 => "Good evening",
+        _ => "Hey there, night owl",
+    }
+}
+
 /// A small rounded label in the header.
 fn chip(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32, tip: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.0), fg);
@@ -1790,10 +1903,15 @@ fn mic_orb(ui: &mut egui::Ui, t: &Theme, listening: bool, level: f32, hands_free
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
     let c = rect.center();
     let p = ui.painter();
-    let base = if listening && !hands_free { t.red } else if listening { t.accent } else { t.tertiary };
+    // Always warm: your pal's button. Breathes gently while idle, glows with your voice while listening.
+    let base = if listening && !hands_free { t.red } else { t.accent };
+    let time = ui.input(|i| i.time) as f32;
     if listening {
         p.circle_filled(c, size / 2.0 + 2.0 + level * 10.0, base.gamma_multiply(0.18));
+    } else {
+        crate::welcome::soft_circle(p, c, size * (0.85 + 0.05 * (time * 1.4).sin()), base.gamma_multiply(0.35));
     }
+    let base = if listening { base } else { base.gamma_multiply(0.82) };
     let fill = if resp.hovered() { base.gamma_multiply(0.9) } else { base };
     p.circle_filled(c, size / 2.0, fill);
     icons::paint(p, Icon::Mic, Rect::from_center_size(c, Vec2::splat(20.0)), Color32::WHITE);
@@ -1915,8 +2033,6 @@ impl App {
             let mut done = false;
             let mut toggle_listening = false;
             let mut open_about: Option<Option<String>> = None;
-            let eleven_key = &mut self.eleven_key;
-            let eleven_note = &mut self.eleven_note;
             let resp = egui::Modal::new(Id::new("settings")).frame(sheet_frame).backdrop_color(backdrop).show(ctx, |ui| {
                 let mut data = shared.data.lock().unwrap();
                 let before = format!("{:?}", data.settings);
@@ -1999,57 +2115,29 @@ impl App {
                         });
                         form_sep(ui, t);
                         form_row(ui, t, "Voices", |ui| {
-                            let cur = if data.settings.tts_engine == "elevenlabs" { 1 } else { 0 };
-                            if let Some(i) = segmented(ui, t, cur, &["Apple", "ElevenLabs"]) {
-                                data.settings.tts_engine = if i == 1 { "elevenlabs".into() } else { "apple".into() };
-                                voice::set_engine(i == 1);
+                            let cur = if data.settings.voice_engine == "local" { 0 } else { 1 };
+                            if let Some(i) = segmented(ui, t, cur, &["Natural (on this Mac)", "Apple"]) {
+                                data.settings.voice_engine = if i == 0 { "local".into() } else { "apple".into() };
+                                voice::set_engine(i == 0);
                                 voice::stop_speaking();
                             }
-                        });
-                        if data.settings.tts_engine == "elevenlabs" {
-                            use crate::elevenlabs as el;
-                            if el::has_key() {
-                                form_row(ui, t, "API key", |ui| {
-                                    ui.label(RichText::new("Saved in your Keychain").color(t.text));
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.button("Remove").clicked() {
-                                            el::remove_key();
-                                            *eleven_note = None;
-                                        }
-                                        if ui.button("Hear").clicked() {
-                                            voice::stop_speaking();
-                                            voice::speak("Hi, this is how I sound with ElevenLabs.", &voice::agent_voice(0, "", ""));
-                                        }
-                                    });
-                                });
-                                let n = el::cached_voices().len();
-                                let note = match el::problem() {
-                                    Some(p) => format!("{p} Using the Apple voice meanwhile."),
-                                    None if n > 0 => format!("{n} voices on your account. Pick one per agent under Team; each reply read aloud uses ElevenLabs credits."),
-                                    None => "Loading your voices…".into(),
-                                };
-                                ui.add(egui::Label::new(RichText::new(note).size(11.5).color(if el::problem().is_some() { t.red } else { t.secondary })).wrap());
-                            } else {
-                                form_row(ui, t, "API key", |ui| {
-                                    let save = ui.add(egui::TextEdit::singleline(eleven_key).password(true).hint_text("Paste your ElevenLabs API key").desired_width(260.0));
-                                    let enter = save.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    if (ui.button("Save").clicked() || enter) && !eleven_key.trim().is_empty() {
-                                        *eleven_note = Some(match el::save_key(eleven_key) {
-                                            Ok(()) => {
-                                                let c = ctx.clone();
-                                                el::load_voices(move || c.request_repaint());
-                                                String::new()
-                                            }
-                                            Err(e) => e,
-                                        });
-                                        eleven_key.clear();
+                            if data.settings.voice_engine == "local" {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.button("Hear").clicked() {
+                                        voice::stop_speaking();
+                                        voice::speak("Hi, this is how I sound.", &voice::agent_voice(0, "", ""));
                                     }
                                 });
-                                let note = eleven_note.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| {
-                                    "Get a key at elevenlabs.io → Developers → API Keys. It's stored in the macOS Keychain, not in YesHarness's files. Until then, replies use the Apple voice.".into()
-                                });
-                                ui.add(egui::Label::new(RichText::new(note).size(11.5).color(t.secondary)).wrap());
                             }
+                        });
+                        if data.settings.voice_engine == "local" {
+                            let st = crate::localvoice::status();
+                            let note = if st.is_empty() {
+                                "Natural voices that run on your Mac: Kokoro for English, Kyutai Pocket TTS for German, French, Italian and Portuguese. Free, private, no account. Pick a voice per agent under Team.".to_string()
+                            } else {
+                                format!("{st} (English is about 90 MB, downloaded once.)")
+                            };
+                            ui.add(egui::Label::new(RichText::new(note).size(11.5).color(t.secondary)).wrap());
                         }
                         form_sep(ui, t);
                         form_row(ui, t, "Recognition", |ui| {
@@ -2472,26 +2560,26 @@ impl App {
                                 );
                             });
                             form_sep(ui, t);
-                            if voice::uses_elevenlabs() {
-                                form_row(ui, t, "ElevenLabs voice", |ui| {
-                                    use crate::elevenlabs as el;
-                                    let auto = el::auto_voice(idx);
-                                    let auto_label = format!("Automatic ({})", el::voice_name(&auto));
-                                    let current = if a.eleven_voice.is_empty() { auto_label.clone() } else { el::voice_name(&a.eleven_voice) };
-                                    egui::ComboBox::from_id_salt(format!("el-voice-{}", a.id)).selected_text(current).width(230.0).show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut a.eleven_voice, String::new(), auto_label);
-                                        for v in el::cached_voices() {
-                                            ui.selectable_value(&mut a.eleven_voice, v.id.clone(), v.name);
+                            if voice::uses_local() {
+                                form_row(ui, t, "Voice", |ui| {
+                                    use crate::localvoice as lv;
+                                    let auto = lv::auto_voice(idx);
+                                    let auto_label = format!("Automatic ({})", lv::voice_name(auto));
+                                    let current = if a.local_voice.is_empty() { auto_label.clone() } else { lv::voice_name(&a.local_voice) };
+                                    egui::ComboBox::from_id_salt(format!("local-voice-{}", a.id)).selected_text(current).width(230.0).show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut a.local_voice, String::new(), auto_label);
+                                        for (id, name) in lv::VOICES {
+                                            ui.selectable_value(&mut a.local_voice, id.to_string(), name);
                                         }
                                     });
                                     if icon_button(ui, t, Icon::Play, 24.0, false, "Hear it").clicked() {
                                         voice::stop_speaking();
-                                        voice::speak(&format!("Hi, I'm {}.", a.name()), &voice::agent_voice(idx, &a.voice, &a.eleven_voice));
+                                        voice::speak(&format!("Hi, I'm {}.", a.name()), &voice::agent_voice(idx, &a.voice, &a.local_voice));
                                     }
                                 });
                                 form_sep(ui, t);
                             }
-                            form_row(ui, t, if voice::uses_elevenlabs() { "Apple voice" } else { "Voice" }, |ui| {
+                            form_row(ui, t, if voice::uses_local() { "Apple voice" } else { "Voice" }, |ui| {
                                 let auto = voice::auto_voice(idx);
                                 let auto_label = if auto.is_empty() { "System voice".to_string() } else { auto.clone() };
                                 let current = if a.voice.is_empty() { format!("Automatic ({auto_label})") } else { a.voice.clone() };

@@ -65,9 +65,9 @@ pub struct Agent {
     /// macOS voice for reading its replies ("" = automatic, a different one per agent).
     #[serde(default)]
     pub voice: String,
-    /// ElevenLabs voice id, when replies are read with ElevenLabs ("" = automatic).
+    /// Natural voice on this Mac (Kokoro voice id, e.g. "af_heart"; "" = automatic, one per agent).
     #[serde(default)]
-    pub eleven_voice: String,
+    pub local_voice: String,
     /// How hard it thinks: "low" (quick), "" (the engine's default) or "high" (deep).
     #[serde(default)]
     pub effort: String,
@@ -224,6 +224,12 @@ pub struct Settings {
     /// Alex's routine turns use one cheap, tool-free call; it switches to its full tools only when needed.
     #[serde(default = "yes")]
     pub quick_routing: bool,
+    /// The sidebar is hidden (Ctrl+Cmd+S or the sidebar button toggles it).
+    #[serde(default)]
+    pub sidebar_hidden: bool,
+    /// The "Your team" list in the sidebar is folded away.
+    #[serde(default)]
+    pub team_collapsed: bool,
     /// The first-run questions were answered (or skipped).
     #[serde(default)]
     pub onboarded: bool,
@@ -234,9 +240,9 @@ pub struct Settings {
     /// so you can interrupt them just by talking.
     #[serde(default = "yes")]
     pub barge_in: bool,
-    /// Reading replies aloud: "apple" (macOS voices) or "elevenlabs" (needs your API key; Apple is the fallback).
-    #[serde(default = "apple")]
-    pub tts_engine: String,
+    /// Reading replies aloud: "local" (natural voices on this Mac; the default) or "apple" (macOS voices).
+    #[serde(default = "local")]
+    pub voice_engine: String,
     /// Speech recognition: "apple" (built in) or "parakeet" (Parakeet Ultra, downloaded once).
     #[serde(default = "default_engine")]
     pub stt_engine: String,
@@ -246,8 +252,8 @@ pub struct Settings {
 }
 
 /// Parakeet Ultra by default: clearly more accurate. Apple's recognizer is used until it's set up.
-fn apple() -> String {
-    "apple".into()
+fn local() -> String {
+    "local".into()
 }
 
 fn default_engine() -> String {
@@ -271,7 +277,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, tts_engine: apple(), barge_in: true, onboarded: false, languages: Vec::new() }
+        Settings { voice_auto_send: true, read_aloud: cfg!(target_os = "macos"), hands_free: cfg!(target_os = "macos"), show_keyboard: !cfg!(target_os = "macos"), speech_speed: default_speech_speed(), theme: auto_theme(), stt_engine: default_engine(), quick_routing: true, memory: true, voice_engine: local(), barge_in: true, onboarded: false, languages: Vec::new(), sidebar_hidden: false, team_collapsed: false }
     }
 }
 
@@ -429,7 +435,7 @@ impl Template {
             description: self.role.into(),
             briefing: self.briefing.split_whitespace().collect::<Vec<_>>().join(" ").replace(" - ", "\n- "),
             voice: String::new(),
-            eleven_voice: String::new(),
+            local_voice: String::new(),
             // The main agent mostly routes and summarizes: quick thinking keeps the conversation snappy.
             effort: if self.handle == "main" { "low".into() } else { String::new() },
             use_my_plugins: false,

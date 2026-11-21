@@ -1,4 +1,5 @@
-//! Look & feel: macOS system fonts and colors, light + dark, following the system appearance.
+//! Look & feel: macOS system fonts with warm colors (cream and coral by day, plum and coral at night),
+//! following the system appearance.
 
 use eframe::egui::{
     self, style::ScrollStyle, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Shadow, Stroke,
@@ -44,49 +45,51 @@ impl Theme {
         }
     }
 
+    /// Warm evening: plum-brown surfaces, cream text, coral accent.
     pub fn dark() -> Theme {
-        let white = Color32::WHITE;
+        let cream = Color32::from_rgb(255, 240, 228);
         Theme {
             dark: true,
-            bg: Color32::from_rgb(30, 30, 32),
-            sidebar: Color32::from_rgb(40, 39, 43),
-            card: Color32::from_rgb(44, 44, 47),
-            text: Color32::from_rgb(223, 223, 227),
-            strong: Color32::from_rgb(250, 250, 252),
-            secondary: Color32::from_rgb(152, 152, 158),
-            tertiary: Color32::from_rgb(105, 105, 110),
-            separator: a(white, 0.09),
-            accent: Color32::from_rgb(10, 132, 255),
-            control: a(white, 0.08),
-            hover: a(white, 0.06),
-            selected_row: a(white, 0.10),
-            code_bg: Color32::from_rgb(38, 38, 41),
-            red: Color32::from_rgb(255, 69, 58),
-            amber: Color32::from_rgb(255, 179, 64),
-            teal: Color32::from_rgb(64, 200, 190),
+            bg: Color32::from_rgb(34, 26, 30),
+            sidebar: Color32::from_rgb(43, 33, 38),
+            card: Color32::from_rgb(52, 40, 45),
+            text: Color32::from_rgb(239, 227, 218),
+            strong: Color32::from_rgb(255, 246, 239),
+            secondary: Color32::from_rgb(181, 158, 148),
+            tertiary: Color32::from_rgb(128, 108, 101),
+            separator: a(cream, 0.09),
+            accent: Color32::from_rgb(244, 132, 98),
+            control: a(cream, 0.08),
+            hover: a(cream, 0.06),
+            selected_row: Color32::from_rgba_unmultiplied(244, 132, 98, 46),
+            code_bg: Color32::from_rgb(46, 36, 41),
+            red: Color32::from_rgb(255, 105, 92),
+            amber: Color32::from_rgb(240, 178, 90),
+            teal: Color32::from_rgb(127, 193, 169),
         }
     }
 
+    /// Warm daylight: cream and sand surfaces, brown text, coral accent.
     pub fn light() -> Theme {
-        let black = Color32::BLACK;
+        let brown = Color32::from_rgb(70, 40, 28);
         Theme {
             dark: false,
-            bg: Color32::from_rgb(255, 255, 255),
-            sidebar: Color32::from_rgb(242, 241, 244),
-            card: Color32::from_rgb(246, 246, 248),
-            text: Color32::from_rgb(40, 40, 44),
-            strong: Color32::from_rgb(10, 10, 12),
-            secondary: Color32::from_rgb(128, 128, 134),
-            tertiary: Color32::from_rgb(172, 172, 178),
-            separator: a(black, 0.09),
-            accent: Color32::from_rgb(0, 122, 255),
-            control: a(black, 0.06),
-            hover: a(black, 0.045),
-            selected_row: a(black, 0.075),
-            code_bg: Color32::from_rgb(243, 243, 246),
-            red: Color32::from_rgb(255, 59, 48),
-            amber: Color32::from_rgb(214, 136, 0),
-            teal: Color32::from_rgb(0, 160, 150),
+            bg: Color32::from_rgb(255, 250, 245),
+            sidebar: Color32::from_rgb(247, 237, 228),
+            card: Color32::from_rgb(255, 242, 232),
+            text: Color32::from_rgb(58, 42, 36),
+            strong: Color32::from_rgb(36, 22, 15),
+            secondary: Color32::from_rgb(140, 111, 99),
+            tertiary: Color32::from_rgb(191, 166, 153),
+            separator: a(brown, 0.10),
+            accent: Color32::from_rgb(226, 98, 68),
+            control: a(brown, 0.07),
+            hover: a(brown, 0.05),
+            selected_row: Color32::from_rgba_unmultiplied(226, 98, 68, 34),
+            code_bg: Color32::from_rgb(248, 238, 230),
+            red: Color32::from_rgb(214, 66, 52),
+            amber: Color32::from_rgb(196, 124, 20),
+            teal: Color32::from_rgb(76, 146, 122),
         }
     }
 }
