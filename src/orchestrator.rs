@@ -533,7 +533,7 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         let data = shared.data.lock().unwrap();
         let Some(ch) = data.channel(cid) else { return };
         let idx = data.agents.iter().position(|a| a.id == agent.id).unwrap_or(0);
-        let voice_name = if agent.voice.is_empty() { voice::auto_voice(idx) } else { agent.voice.clone() };
+        let voice_name = voice::agent_voice(idx, &agent.voice, &agent.eleven_voice);
         (data.members(ch), PathBuf::from(&ch.folder), ch.sessions.clone(), data.settings.read_aloud, voice_name)
     };
     if !folder.is_dir() {
@@ -1377,6 +1377,7 @@ mod tests {
             description: String::new(),
             briefing: String::new(),
             voice: String::new(),
+            eleven_voice: String::new(),
             effort: String::new(),
             use_my_plugins: false,
             internet: true,

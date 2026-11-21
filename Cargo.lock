@@ -5509,6 +5509,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
