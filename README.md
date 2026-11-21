@@ -153,6 +153,11 @@ $Y --send website "Build a landing page for my app"   # says it in that channel,
 Requests go through a small inbox folder (`~/Library/Application Support/YesHarness/inbox`). The app picks
 them up within a moment, which makes it easy to script, or to use from Shortcuts or other tools.
 
+## Versions
+
+Every pull request merged into `main` bumps the version by 0.1 (0.2 → 0.3 … 0.9 → 1.0) and tags it, via
+`.github/workflows/bump-version.yml` and `scripts/bump_version.py`. Label a PR `no-bump` to skip.
+
 ## Troubleshooting from Terminal
 
 ```bash
