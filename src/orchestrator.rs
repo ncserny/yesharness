@@ -394,6 +394,59 @@ fn mark_failure(shared: &Shared, eff: &Agent, failure: &Failure) {
 }
 
 fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mutex<Turns>, depth: u32) {
+    turn_inst(shared, cid, agent_id, mode, turns, depth, 0)
+}
+
+/// The General helper: created the first time someone is busy, on the main agent's engine, in every channel.
+fn ensure_general(shared: &Shared) -> Option<String> {
+    let mut data = shared.data.lock().unwrap();
+    if let Some(a) = data.agents.iter().find(|a| a.handle == "general") {
+        let id = a.id.clone();
+        for ch in data.channels.iter_mut() {
+            if !ch.members.contains(&id) {
+                ch.members.push(id.clone());
+            }
+        }
+        return Some(id);
+    }
+    let tpl = model::TEMPLATES.iter().find(|t| t.handle == "general")?;
+    let mut g = tpl.agent(model::PALETTE[5]);
+    if let Some(main) = data.agents.iter().find(|a| a.handle == "main").or(data.agents.first()) {
+        // Same engine as the main agent (and its command, for custom setups).
+        g.kind = main.kind;
+        g.command = main.command.clone();
+        g.full_access = main.full_access;
+    }
+    g.display_name = "General".into();
+    let id = g.id.clone();
+    data.agents.push(g);
+    for ch in data.channels.iter_mut() {
+        ch.members.push(id.clone());
+    }
+    shared.dirty.store(true, Ordering::Relaxed);
+    Some(id)
+}
+
+/// A free General helper instance in this channel (not `skip`), if any. Instances > 0 run without a saved session.
+fn free_general(shared: &Shared, cid: &str, skip: (&str, usize)) -> Option<(String, usize)> {
+    let gid = ensure_general(shared)?;
+    for inst in 0..4 {
+        if (gid.as_str(), inst) == skip {
+            continue;
+        }
+        let key = if inst == 0 { format!("{cid}:{gid}") } else { format!("{cid}:{gid}#{inst}") };
+        let lock = shared.agent_locks.lock().unwrap().entry(key).or_default().clone();
+        let free = lock.try_lock().is_ok();
+        if free {
+            return Some((gid, inst));
+        }
+    }
+    None
+}
+
+/// `inst`: which copy of the agent (0 = the agent itself; 1+ = extra General helpers, no saved session).
+#[allow(clippy::too_many_arguments)]
+fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mutex<Turns>, depth: u32, inst: usize) {
     if shared.cancelled(cid) {
         return;
     }
@@ -444,10 +497,21 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
     shared.activity.lock().unwrap().entry(cid.to_string()).or_default().insert(agent.handle.clone());
 
     // One turn at a time per agent (its CLI session can't take two at once); others keep working meanwhile.
-    let lock = shared.agent_locks.lock().unwrap().entry(format!("{cid}:{}", agent.id)).or_default().clone();
+    let key = if inst == 0 { format!("{cid}:{}", agent.id) } else { format!("{cid}:{}#{inst}", agent.id) };
+    let lock = shared.agent_locks.lock().unwrap().entry(key).or_default().clone();
     let guard = match lock.try_lock() {
         Ok(g) => g,
         Err(_) => {
+            // Busy: rather than make you wait, a General helper takes it.
+            if matches!(mode, Mode::User | Mode::Delegated { .. }) {
+                if let Some((gid, ginst)) = free_general(shared, cid, (agent.id.as_str(), inst)) {
+                    let gname = shared.data.lock().unwrap().agent(&gid).map(|a| a.name().to_string()).unwrap_or_else(|| "General".into());
+                    let label = if ginst == 0 { gname } else { format!("{gname} #{}", ginst + 1) };
+                    shared.post(cid, Author::System, format!("{} is busy, so {label} is taking this.", agent.name()), false);
+                    turns.lock().unwrap().budget += 1;
+                    return turn_inst(shared, cid, &gid, mode, turns, depth, ginst);
+                }
+            }
             shared.set_status(cid, &agent.handle, "finishing its previous turn first…".into());
             lock.lock().unwrap_or_else(|e| e.into_inner())
         }
@@ -494,7 +558,8 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
     } else {
         Vec::new()
     };
-    let mut session = if eff.kind.supports_sessions() { sessions.get(&session_key(&eff)).cloned() } else { None };
+    // Extra helper copies start fresh each time (two copies can't share one CLI session).
+    let mut session = if eff.kind.supports_sessions() && inst == 0 { sessions.get(&session_key(&eff)).cloned() } else { None };
     let mut out;
     let mut used_model;
     let mut tries = 0;
@@ -596,7 +661,7 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
         let mut data = shared.data.lock().unwrap();
         let selected = data.selected.as_deref() == Some(cid);
         if let Some(ch) = data.channel_mut(cid) {
-            if let Some(s) = &out.session {
+            if let (Some(s), 0) = (&out.session, inst) {
                 ch.sessions.insert(session_key(&eff), s.clone());
             }
             ch.messages.push(Message {
@@ -731,8 +796,9 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
     p.push_str(&match mode {
         Mode::User => "Respond to the user's latest message above.".to_string(),
         Mode::Delegated { from } => format!(
-            "@{from} handed you a task (the line starting with \"@{me}:\" above, plus anything said since). \
-             Do it, then reply with a short report of what you did and the result. Your reply goes back to @{from}.",
+            "@{from} handed you a task: the line starting with \"@{me}:\" above (or, if you're standing in for a busy \
+             teammate, the latest \"@name:\" line from @{from}), plus anything said since. Do it, then reply with a short \
+             report of what you did and the result. Your reply goes back to @{from}.",
             from = name(from),
             me = me.handle
         ),
@@ -1228,6 +1294,25 @@ mod tests {
         let pos = |t: &str| msgs.iter().position(|(_, m)| m == t).unwrap_or_else(|| panic!("missing {t}: {msgs:#?}"));
         assert!(pos("quick answer") < pos("slow done"), "the quick question waited for the slow task: {msgs:#?}");
         assert_eq!(msgs.iter().filter(|(_, m)| m == "All done").count(), 1);
+    }
+
+    /// The lead is still busy when you send something else: a General helper takes it instead of making you wait.
+    #[test]
+    fn general_helper_steps_in_when_busy() {
+        let lead = agent("L", "main", r#"input=$(cat); if printf '%s' "$input" | grep -q 'Your role: General'; then echo "second done"; else sleep 2; echo "first done"; fi"#);
+        let data = Data { agents: vec![lead], channels: vec![channel(&["L"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "first, a slow one".into());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        send(&shared, "c", "second, quick".into());
+        let msgs = wait(&shared);
+        let pos = |t: &str| msgs.iter().position(|(_, m)| m == t).unwrap_or_else(|| panic!("missing {t}: {msgs:#?}"));
+        assert!(msgs.iter().any(|(_, m)| m.contains("is busy, so General is taking this")), "{msgs:#?}");
+        assert!(pos("second done") < pos("first done"), "{msgs:#?}");
+        let data = shared.data.lock().unwrap();
+        let g = data.agents.iter().find(|a| a.handle == "general").expect("General created");
+        assert!(data.channels[0].members.contains(&g.id));
+        assert_eq!(g.kind, AgentKind::Custom, "runs on the main agent's engine");
     }
 
     #[test]

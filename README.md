@@ -41,6 +41,9 @@ hands it out to the specialists, then tells you how it went.
   taken", and the agent is sent back once to do it for real. The main agent also gets these facts every turn, so it
   can't report imaginary progress. Handoffs count whether written as `@developer: …` or `@developer, …` at the start
   of a sentence.
+- **Nobody waits:** each message is handled right away, even while teammates work on earlier ones. An agent runs
+  one turn at a time; if the one needed is busy, a **General helper** steps in. It's created automatically, runs
+  on the main agent's engine, and starts extra copies (up to four) when it's busy too.
 - **Parallel handoffs:** when the main agent briefs several teammates in one message, they work at the
   same time, and the chat shows everyone who's working and what they're doing.
 - **Speed settings per agent** (Team → Engine):

@@ -365,6 +365,16 @@ pub const TEMPLATES: &[Template] = &[
                    consistency with AGENTS.md, and give concrete, prioritized fixes. Make small fixes yourself when \
                    they're obviously right; list the rest.",
     },
+    Template {
+        title: "General helper",
+        handle: "general",
+        kind: AgentKind::Codex,
+        role: "General helper: steps in for anything (questions, research, quick fixes, small tasks) when the others are busy.",
+        briefing: "You are the team's general helper. You step in when the main agent or a specialist is busy, so the \
+                   user never has to wait. Handle whatever comes: answer questions, look things up, check things, make \
+                   small changes, or take over a task that was meant for a busy teammate. Do the work yourself with your \
+                   tools and report briefly: one or two sentences, plus where to find results.",
+    },
 ];
 
 impl Template {
