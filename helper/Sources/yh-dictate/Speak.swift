@@ -13,6 +13,8 @@ final class Speaker: @unchecked Sendable {
     var pocket: [String: PocketTtsManager] = [:]
 
     static let pocketLanguages: [String: PocketTtsLanguage] = ["de": .german, "fr": .french24L, "it": .italian, "pt": .portuguese]
+    static let maleVoices: [String: String] = ["de": "juergen", "fr": "jean", "it": "giovanni", "pt": "rafael"]
+    static let femaleVoices: [String: String] = ["de": "anna", "fr": "estelle", "it": "lola", "pt": "vera"]
 
     func language(of text: String) -> String {
         let r = NLLanguageRecognizer()
@@ -57,7 +59,14 @@ final class Speaker: @unchecked Sendable {
                 let v = voice.flatMap { KokoroAneConstants.englishVoices.contains($0) ? $0 : nil }
                 wav = try await k.synthesize(text: text, voice: v, speed: speed)
             } else if let p = try await pocketManager(lang) {
-                wav = try await p.synthesize(text: text)
+                // Same kind of voice as the agent's English one ("am_…"/"bm_…" are male).
+                let male = voice.map { $0.count > 1 && Array($0)[1] == "m" } ?? false
+                let pv = male ? (Speaker.maleVoices[lang] ?? "juergen") : (Speaker.femaleVoices[lang] ?? "alba")
+                do {
+                    wav = try await p.synthesize(text: text, voice: pv)
+                } catch {
+                    wav = try await p.synthesize(text: text)
+                }
             } else {
                 out("E:" + outPath + "\tunsupported")
                 return

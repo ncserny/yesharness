@@ -11,10 +11,10 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// English voices (Kokoro), nicest first: (id, name).
+/// English voices (Kokoro): (id, name). The first is the main agent's (Alex: a warm male voice).
 pub const VOICES: [(&str, &str); 10] = [
-    ("af_heart", "Heart (American)"),
     ("am_michael", "Michael (American)"),
+    ("af_heart", "Heart (American)"),
     ("bf_emma", "Emma (British)"),
     ("am_fenrir", "Fenrir (American)"),
     ("af_bella", "Bella (American)"),
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn every_agent_gets_a_voice() {
-        assert_eq!(auto_voice(0), "af_heart");
+        assert_eq!(auto_voice(0), "am_michael", "Alex is male");
         assert_ne!(auto_voice(1), auto_voice(0));
         assert_eq!(voice_name("bf_emma"), "Emma (British)");
     }
