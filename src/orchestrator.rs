@@ -90,7 +90,7 @@ impl Shared {
 
     pub fn post(&self, cid: &str, author: Author, text: String, error: bool) {
         if let Some(ch) = self.data.lock().unwrap().channel_mut(cid) {
-            ch.messages.push(Message { author, text, ts: model::now(), error, to_user: false, via: String::new(), attachments: Vec::new() });
+            ch.messages.push(Message { author, text, ts: model::now(), error, to_user: false, via: String::new(), attachments: Vec::new(), receipt: String::new(), idle_claim: false });
         }
         self.dirty.store(true, Ordering::Relaxed);
         (self.repaint)();
@@ -167,7 +167,7 @@ pub fn send(shared: &Arc<Shared>, cid: &str, text: String) {
 /// Send with images attached (absolute paths inside the project folder).
 pub fn send_with(shared: &Arc<Shared>, cid: &str, text: String, attachments: Vec<String>) {
     if let Some(ch) = shared.data.lock().unwrap().channel_mut(cid) {
-        ch.messages.push(Message { author: Author::User, text: text.clone(), ts: model::now(), error: false, to_user: false, via: String::new(), attachments });
+        ch.messages.push(Message { author: Author::User, text: text.clone(), ts: model::now(), error: false, to_user: false, via: String::new(), attachments, receipt: String::new(), idle_claim: false });
     }
     shared.dirty.store(true, Ordering::Relaxed);
     (shared.repaint)();
@@ -236,6 +236,8 @@ enum Mode {
     Delegated { from: String },
     /// Delegates replied; check their work and wrap up.
     FollowUp,
+    /// It promised work but did nothing: do it now (or say plainly that nothing is needed).
+    Nudge,
 }
 
 struct Turns {
@@ -244,6 +246,8 @@ struct Turns {
     failed: Vec<String>,
     /// Agents that already answered the user for this message (so a stand-in doesn't answer twice).
     answered: Vec<String>,
+    /// Empty promises we've already sent back once.
+    nudges: u32,
 }
 
 fn handle(shared: &Arc<Shared>, cid: &str, text: &str) {
@@ -262,7 +266,7 @@ fn handle(shared: &Arc<Shared>, cid: &str, text: &str) {
     if targets.is_empty() {
         targets.push(members[0].id.clone());
     }
-    let turns = Mutex::new(Turns { budget: MAX_TURNS, failed: Vec::new(), answered: Vec::new() });
+    let turns = Mutex::new(Turns { budget: MAX_TURNS, failed: Vec::new(), answered: Vec::new(), nudges: 0 });
     for t in targets {
         if shared.cancelled(cid) {
             break;
@@ -499,7 +503,29 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
     let (shown, actions) = if out.error { (out.text.clone(), Vec::new()) } else { app_actions(&out.text) };
     let shown = if shown.trim().is_empty() && !actions.is_empty() { "On it.".to_string() } else { shown };
 
-    let to_user = matches!(mode, Mode::User | Mode::FollowUp) && !out.error;
+    // What did this turn really do? (From the engine's events, not from the reply's wording.)
+    let exclude = match &mode {
+        Mode::Delegated { from } => Some(from.clone()),
+        _ => None,
+    };
+    let delegates = if out.error { Vec::new() } else { delegations(&out.text, &members, &agent.id, exclude.as_deref()) };
+    let mut receipt = out.receipt.summary();
+    if !delegates.is_empty() {
+        let names: Vec<String> = delegates.iter().filter_map(|id| members.iter().find(|m| &m.id == id)).map(|m| m.name().to_string()).collect();
+        if !receipt.is_empty() {
+            receipt.push_str(" · ");
+        }
+        receipt.push_str(&format!("handed off to {}", names.join(", ")));
+    }
+    if !actions.is_empty() {
+        if !receipt.is_empty() {
+            receipt.push_str(" · ");
+        }
+        receipt.push_str("app action");
+    }
+    let idle_claim = !out.error && !out.receipt.did_work() && delegates.is_empty() && actions.is_empty() && claims_work(&shown, &members);
+
+    let to_user = matches!(mode, Mode::User | Mode::FollowUp | Mode::Nudge) && !out.error;
     if matches!(mode, Mode::User) && !out.error {
         turns.lock().unwrap().answered.push(agent.id.clone());
     }
@@ -523,6 +549,8 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
                 to_user,
                 via,
                 attachments: Vec::new(),
+                receipt,
+                idle_claim,
             });
             ch.seen.insert(agent.id.clone(), ch.messages.len());
             if !selected {
@@ -548,15 +576,31 @@ fn turn(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns: &Mut
         }
         return;
     }
-    if depth >= MAX_DEPTH {
-        return;
+    // Said work was happening, but nothing was run, edited or handed off: send it back once.
+    if idle_claim && !shared.cancelled(cid) {
+        let again = {
+            let mut t = turns.lock().unwrap();
+            let ok = t.nudges < 2 && t.budget > 0;
+            if ok {
+                t.nudges += 1;
+            }
+            ok
+        };
+        if again {
+            shared.post(
+                cid,
+                Author::System,
+                format!("{} said work was happening, but nothing was run, edited or handed off. Sending {} back to actually do it.", agent.name(), agent.name()),
+                true,
+            );
+            let next = match &mode {
+                Mode::Delegated { from } => Mode::Delegated { from: from.clone() },
+                _ => Mode::Nudge,
+            };
+            return turn(shared, cid, &agent.id, next, turns, depth);
+        }
     }
-    let exclude = match &mode {
-        Mode::Delegated { from } => Some(from.as_str()),
-        _ => None,
-    };
-    let delegates = delegations(&out.text, &members, &agent.id, exclude);
-    if delegates.is_empty() {
+    if depth >= MAX_DEPTH || delegates.is_empty() {
         return;
     }
     if delegates.len() == 1 {
@@ -633,6 +677,11 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
             from = name(from),
             me = me.handle
         ),
+        Mode::Nudge => "Your last reply said work was starting or done, but you ran no command, edited no file and \
+                        handed nothing off, so NOTHING IS HAPPENING. Fix that now: do the work with your tools, or hand it off \
+                        with a line that starts with \"@name:\" and a complete brief. If no work is actually needed, say so \
+                        plainly in one sentence. Don't describe plans."
+            .to_string(),
         Mode::FollowUp => "The agents you handed work to have replied above. Check their results. If something is \
                            missing or wrong, hand it off again; otherwise give the user a short final answer."
             .to_string(),
@@ -642,6 +691,10 @@ fn build_prompt(ch: &Channel, me: &Agent, members: &[Agent], data: &Data, mode: 
             "\n(Your reply is read aloud to the user. Keep it short: one or two plain spoken sentences that \
              answer or summarize. Add details, code or lists only if the user asked for them.)",
         );
+    }
+    // Facts from the app, so the main agent never reports imaginary progress.
+    if members.first().is_some_and(|m| m.id == me.id) && !matches!(mode, Mode::Delegated { .. }) {
+        p.push_str(&facts(ch, me, data, shared));
     }
     // The main agent can run the app itself. Repeated every turn so it also reaches ongoing sessions.
     let is_main = members.first().is_some_and(|m| m.id == me.id);
@@ -906,7 +959,61 @@ fn mention_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// Lines like `@codex: do X` (also `- **@codex:** do X`) in an agent reply.
+/// Does this reply claim that work is starting, ongoing or done? (Checked against what actually happened.)
+pub fn claims_work(text: &str, members: &[Agent]) -> bool {
+    let t = text.to_lowercase().replace('’', "'");
+    const PHRASES: [&str; 29] = [
+        "i'll ", "i will ", "on it", "right away", "i'm starting", "starting now", "i'm on ", "i'm going to",
+        "i've created", "i've added", "i've updated", "i've fixed", "i've changed", "i have created", "i have updated",
+        "i fixed", "i created", "i updated", "working on it", "dive into", "diving into", "will start", "kick off",
+        "is working on", "are working on", "has started", "have started", "i've asked", "i asked",
+    ];
+    if PHRASES.iter().any(|p| t.contains(p)) {
+        return true;
+    }
+    // Mentions a teammate as if assigning work, without a real handoff.
+    members.iter().any(|m| t.contains(&format!("@{}", m.handle.to_lowercase())))
+}
+
+/// What really happened recently in this channel, for the main agent's prompt.
+fn facts(ch: &Channel, me: &Agent, data: &Data, shared: &Shared) -> String {
+    let working: Vec<String> = shared
+        .runs
+        .lock()
+        .unwrap()
+        .get(&ch.id)
+        .map(|r| r.working.iter().filter(|(h, _)| *h != me.handle).map(|(h, st)| format!("@{h} ({st})")).collect())
+        .unwrap_or_default();
+    let now = model::now();
+    let recent: Vec<String> = ch
+        .messages
+        .iter()
+        .rev()
+        .filter(|m| matches!(m.author, Author::Agent(_)))
+        .take(8)
+        .map(|m| {
+            let who = match &m.author {
+                Author::Agent(id) => data.agent(id).map(|a| a.name().to_string()).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let did = if m.receipt.is_empty() { "no actions".to_string() } else { m.receipt.clone() };
+            let flag = if m.idle_claim { " (claimed work but did nothing)" } else { "" };
+            format!("- {} min ago, {who}: {did}{flag}", now.saturating_sub(m.ts) / 60)
+        })
+        .collect();
+    format!(
+        "\n## Facts from the app (trust these over what anyone said)\n\
+         Working right now besides you: {}.\n\
+         What agents actually did in their recent turns (newest first):\n{}\n\
+         Work only happens when someone runs commands, edits files, or you hand it off with a line \"@name: task\". \
+         Never say work is in progress unless it shows up here or you start it in this reply.\n",
+        if working.is_empty() { "nobody".to_string() } else { working.join(", ") },
+        if recent.is_empty() { "- nothing yet".to_string() } else { recent.join("\n") }
+    )
+}
+
+/// Handoffs in an agent reply: `@codex: do X`, `- **@codex:** do X`, and also `@developer, do X` at the start of a
+/// line or sentence (weaker models write it that way). "Thanks @developer, …" mid-sentence is not a handoff.
 pub fn delegations(reply: &str, members: &[Agent], me: &str, exclude: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_code = false;
@@ -920,15 +1027,27 @@ pub fn delegations(reply: &str, members: &[Agent], me: &str, exclude: Option<&st
             continue;
         }
         let l = l.trim_start_matches(|c: char| c == '-' || c == '*' || c == '>' || c == '_' || c.is_whitespace());
-        let Some(rest) = l.strip_prefix('@') else { continue };
-        let handle: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-        let after = rest[handle.len()..].trim_start_matches(['*', '_']);
-        if !after.starts_with(':') || after[1..].trim().is_empty() {
-            continue;
+        // Candidates: the start of the line, and the start of each sentence in it.
+        let mut starts = vec![0usize];
+        for (i, _) in l.match_indices(['.', '!', '?']) {
+            let rest = &l[i + 1..];
+            let skip = rest.len() - rest.trim_start().len();
+            if skip > 0 {
+                starts.push(i + 1 + skip);
+            }
         }
-        if let Some(a) = members.iter().find(|a| a.answers_to(&handle)) {
-            if a.id != me && Some(a.id.as_str()) != exclude && !out.contains(&a.id) {
-                out.push(a.id.clone());
+        for st in starts {
+            let seg = l[st..].trim_start_matches(['*', '_']);
+            let Some(rest) = seg.strip_prefix('@') else { continue };
+            let handle: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+            let after = rest[handle.len()..].trim_start_matches(['*', '_']);
+            if !(after.starts_with(':') || after.starts_with(',')) || after[1..].trim().len() < 3 {
+                continue;
+            }
+            if let Some(a) = members.iter().find(|a| a.answers_to(&handle)) {
+                if a.id != me && Some(a.id.as_str()) != exclude && !out.contains(&a.id) {
+                    out.push(a.id.clone());
+                }
             }
         }
     }
@@ -993,6 +1112,41 @@ mod tests {
         let msgs = wait(&shared);
         assert_eq!(msgs.last().unwrap().1, "WINDOWS_OK");
         assert!(!shared.data.lock().unwrap().channels[0].messages.last().unwrap().error);
+    }
+
+    #[test]
+    fn catches_handoffs_weaker_models_write() {
+        let m = vec![agent("a", "main", ""), agent("b", "developer", "")];
+        // The exact reply from the screenshot:
+        let r = "We can add optional 11 Labs voice support. @developer, create a toggle in the audio settings.";
+        assert_eq!(delegations(r, &m, "a", None), vec!["b".to_string()]);
+        assert!(delegations("Thanks @developer, that looks good.", &m, "a", None).is_empty());
+        assert!(claims_work("Got it—I'll dive into the Windows test failure right away.", &m));
+        assert!(claims_work("I asked @developer to look at it.", &m));
+        assert!(!claims_work("A harness is the software around an AI.", &m));
+        assert!(!claims_work("Sure, let me know which file.", &m));
+    }
+
+    /// The lead promises work but does nothing: the app flags it and sends it back once; then it hands off for real.
+    #[test]
+    fn empty_promises_are_sent_back() {
+        let lead = agent(
+            "L",
+            "lead",
+            r#"input=$(cat); if printf '%s' "$input" | grep -q 'NOTHING IS HAPPENING'; then echo "@helper: add the toggle"; elif printf '%s' "$input" | grep -q 'have replied above'; then echo "Done: toggle added."; else echo "On it, I'll start right away."; fi"#,
+        );
+        let helper = agent("H", "helper", r#"cat >/dev/null; echo "Added the toggle.""#);
+        let data = Data { agents: vec![lead, helper], channels: vec![channel(&["L", "H"])], selected: None, settings: Default::default() };
+        let shared = Shared::quiet(data);
+        send(&shared, "c", "add a toggle".into());
+        let msgs = wait(&shared);
+        assert!(msgs.iter().any(|(_, t)| t.contains("nothing was run, edited or handed off")), "{msgs:#?}");
+        assert!(msgs.iter().any(|(_, t)| t == "Added the toggle."), "helper never ran: {msgs:#?}");
+        let data = shared.data.lock().unwrap();
+        let first = data.channels[0].messages.iter().find(|m| m.text.starts_with("On it")).unwrap();
+        assert!(first.idle_claim);
+        let handoff = data.channels[0].messages.iter().find(|m| m.text.starts_with("@helper")).unwrap();
+        assert!(handoff.receipt.contains("handed off to helper") && !handoff.idle_claim, "{}", handoff.receipt);
     }
 
     #[test]

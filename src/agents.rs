@@ -16,6 +16,52 @@ pub struct Outcome {
     pub error: bool,
     /// Claude's latest `rate_limit_info`, if it sent one.
     pub rate: Option<Value>,
+    /// What the agent actually did, from the engine's own events (not from what it says).
+    pub receipt: Receipt,
+}
+
+/// The work a turn really did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Receipt {
+    pub commands: usize,
+    /// Files created or edited (names).
+    pub edited: Vec<String>,
+    /// Reads, searches, web lookups, other tools.
+    pub lookups: usize,
+}
+
+impl Receipt {
+    /// Real work: ran something or changed files. (Looking things up alone doesn't count.)
+    pub fn did_work(&self) -> bool {
+        self.commands > 0 || !self.edited.is_empty()
+    }
+
+    fn edit(&mut self, path: &str) {
+        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+        if !name.is_empty() && !self.edited.contains(&name) {
+            self.edited.push(name);
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        match self.commands {
+            0 => {}
+            1 => parts.push("ran 1 command".to_string()),
+            n => parts.push(format!("ran {n} commands")),
+        }
+        if !self.edited.is_empty() {
+            let shown: Vec<&str> = self.edited.iter().take(3).map(String::as_str).collect();
+            let more = if self.edited.len() > 3 { format!(" +{}", self.edited.len() - 3) } else { String::new() };
+            parts.push(format!("edited {}{more}", shown.join(", ")));
+        }
+        match self.lookups {
+            0 => {}
+            1 => parts.push("1 lookup".to_string()),
+            n => parts.push(format!("{n} lookups")),
+        }
+        parts.join(" · ")
+    }
 }
 
 /// Hooks the orchestrator gives a running agent.
@@ -69,8 +115,10 @@ fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>,
             (ctl.status)(st);
         }
     });
+    let receipt = p.receipt.clone();
     let mut out = finish("claude", res, p.session, p.result.or(p.last_text), p.is_error, p.denied, ctl);
     out.rate = p.rate;
+    out.receipt = receipt;
     out
 }
 
@@ -82,6 +130,7 @@ pub struct ClaudeParser {
     pub is_error: bool,
     pub denied: usize,
     pub rate: Option<Value>,
+    pub receipt: Receipt,
 }
 
 impl ClaudeParser {
@@ -108,7 +157,15 @@ impl ClaudeParser {
                             }
                         }
                         Some("tool_use") => {
-                            status = Some(describe_tool(c["name"].as_str().unwrap_or("tool"), &c["input"]));
+                            let name = c["name"].as_str().unwrap_or("tool");
+                            match name {
+                                "Bash" => self.receipt.commands += 1,
+                                "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
+                                    self.receipt.edit(c["input"]["file_path"].as_str().or(c["input"]["notebook_path"].as_str()).unwrap_or("file"))
+                                }
+                                _ => self.receipt.lookups += 1,
+                            }
+                            status = Some(describe_tool(name, &c["input"]));
                         }
                         Some("thinking") => status = Some("thinking…".into()),
                         _ => {}
@@ -194,7 +251,9 @@ fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, 
     });
     let is_error = p.error.is_some() && p.last_text.is_none();
     let text = if is_error { p.error.clone() } else { p.last_text.clone() };
-    finish(if local { "codex (local)" } else { "codex" }, res, p.thread, text, is_error, 0, ctl)
+    let mut out = finish(if local { "codex (local)" } else { "codex" }, res, p.thread, text, is_error, 0, ctl);
+    out.receipt = p.receipt;
+    out
 }
 
 #[derive(Default)]
@@ -202,6 +261,7 @@ pub struct CodexParser {
     pub thread: Option<String>,
     pub last_text: Option<String>,
     pub error: Option<String>,
+    pub receipt: Receipt,
 }
 
 impl CodexParser {
@@ -215,6 +275,18 @@ impl CodexParser {
             "item.started" | "item.updated" | "item.completed" => {
                 let item = &v["item"];
                 let done = v["type"] == "item.completed";
+                if done {
+                    match item["type"].as_str().unwrap_or("") {
+                        "command_execution" => self.receipt.commands += 1,
+                        "file_change" => {
+                            for ch in item["changes"].as_array().into_iter().flatten() {
+                                self.receipt.edit(ch["path"].as_str().unwrap_or("file"));
+                            }
+                        }
+                        "mcp_tool_call" | "web_search" => self.receipt.lookups += 1,
+                        _ => {}
+                    }
+                }
                 match item["type"].as_str()? {
                     "agent_message" if done => {
                         let t = item["text"].as_str().unwrap_or_default().trim().to_string();
@@ -261,7 +333,7 @@ fn clean_error(msg: &str) -> String {
 
 fn run_custom(agent: &Agent, folder: &Path, prompt: &str, ctl: &Ctl) -> Outcome {
     if agent.command.trim().is_empty() {
-        return Outcome { text: "This agent has no command set. Open Agents settings and add one.".into(), session: None, error: true, rate: None };
+        return Outcome { text: "This agent has no command set. Open Agents settings and add one.".into(), session: None, error: true, rate: None, receipt: Receipt::default() };
     }
     let mut cmd = if cfg!(windows) {
         let mut c = env::command("cmd");
@@ -362,10 +434,10 @@ fn finish(
     ctl: &Ctl,
 ) -> Outcome {
     if ctl.cancel.load(Ordering::Relaxed) {
-        return Outcome { text: "(stopped)".into(), session, error: true, rate: None };
+        return Outcome { text: "(stopped)".into(), session, error: true, rate: None, receipt: Receipt::default() };
     }
     match res {
-        Err(e) => Outcome { text: e, session: None, error: true, rate: None },
+        Err(e) => Outcome { text: e, session: None, error: true, rate: None, receipt: Receipt::default() },
         Ok((ok, stderr)) => {
             let mut text = text.unwrap_or_default();
             let mut error = is_error;
@@ -387,7 +459,7 @@ fn finish(
                     "\n\n_({denied} action(s) were blocked by permissions. Turn on \"Full access\" for this agent in Agents settings if you want it to run commands freely.)_"
                 ));
             }
-            Outcome { text, session, error, rate: None }
+            Outcome { text, session, error, rate: None, receipt: Receipt::default() }
         }
     }
 }
@@ -469,6 +541,21 @@ mod tests {
         assert_eq!(p.session.as_deref(), Some("abc"));
         assert_eq!(p.result.as_deref(), Some("Done: all tests pass"));
         assert!(!p.is_error);
+    }
+
+    #[test]
+    fn receipts_count_real_work() {
+        let mut c = CodexParser::default();
+        c.feed(r#"{"type":"item.completed","item":{"type":"command_execution","command":"cargo test"}}"#);
+        c.feed(r#"{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"/p/src/ui.rs","kind":"update"},{"path":"/p/README.md","kind":"add"}]}}"#);
+        assert_eq!(c.receipt.summary(), "ran 1 command · edited ui.rs, README.md");
+        assert!(c.receipt.did_work());
+
+        let mut cl = ClaudeParser::default();
+        cl.feed(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#);
+        assert!(!cl.receipt.did_work(), "reading isn't doing");
+        cl.feed(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/a/b.rs"}}]}}"#);
+        assert_eq!(cl.receipt.summary(), "edited b.rs · 1 lookup");
     }
 
     #[test]

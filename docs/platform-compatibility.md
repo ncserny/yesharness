@@ -2,7 +2,9 @@
 
 Audited 2026-11-20 against the local source and locked dependencies.
 
-**macOS is the only platform built in this session. Linux and Windows are not verified releases.** Only `aarch64-apple-darwin` is installed here. The shared Rust UI, orchestration and persistence provide a plausible port, but do not prove that either other platform compiles or works end to end.
+**Update 2026-11-21:** hosted Linux tests/release build now pass; Windows compiled but failed one attachment-path test. Hosted macOS Rust tests/release build pass, with bundling still running at review time. No platform is claimed as an interactively verified release. See TASKS.md for current evidence.
+
+Historical audit: **macOS was the only platform built in the original session. Linux and Windows were not verified releases.** Only `aarch64-apple-darwin` is installed here. The shared Rust UI, orchestration and persistence provide a plausible port, but do not prove that either other platform compiles or works end to end.
 
 | Area | macOS | Linux | Windows |
 | --- | --- | --- | --- |
@@ -59,6 +61,6 @@ Local evidence: Rust 1.86.0 on Apple Silicon passed `cargo test --offline --lock
 
 The bundling script now propagates Swift build failures instead of hiding them and potentially copying a stale helper. The current Swift-package-based helper could not be rebuilt in this session: its default module cache is outside writable paths; relocating the module cache into target/ then reached `sandbox-exec: sandbox_apply: Operation not permitted`. Thus this run verified the Rust release binary, not a fresh full app bundle. Earlier bundle results above describe the source and helper used at that time.
 
-Hosted execution is pending publication, which remains blocked by this session's Git/network/write permissions. Interactive X11, Wayland, Windows, macOS voice, and live engine checks remain separate requirements.
+Publication and hosted execution have since occurred. At review of commit `7d0f596`, [CI run 44841363709](https://github.com/ncserny/yesharness/actions/runs/44841363709) shows Linux success, Windows failure in the attachment-path assertion (25 passed, 1 failed, 6 ignored), and macOS Rust tests/release success with app bundling still in progress. Local tests now pass 32 with 1 ignored. Git fetch remains blocked in this agent session, but the connector confirms live main matches the checkout. Interactive X11, Wayland, Windows, macOS voice, and live engine checks remain separate requirements.
 
 Workflow references: [GitHub runner labels](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), [eframe Linux dependencies](https://github.com/emilk/egui/blob/main/crates/eframe/README.md), [checkout action](https://github.com/actions/checkout), and [artifact uploads](https://github.com/actions/upload-artifact).

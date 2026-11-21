@@ -120,6 +120,11 @@ fn print_until_idle(shared: &std::sync::Arc<orchestrator::Shared>, cid: &str, mu
                     model::Author::Agent(id) => data.agent(id).map(|a| format!("@{}", a.handle)).unwrap_or_default(),
                 };
                 println!("\n[{who}{}]\n{}", if m.error { " ERROR" } else { "" }, m.text);
+                if m.idle_claim {
+                    println!("   ⚠ no action taken");
+                } else if !m.receipt.is_empty() {
+                    println!("   ↳ {}", m.receipt);
+                }
             }
             printed = data.channels[0].messages.len();
         }

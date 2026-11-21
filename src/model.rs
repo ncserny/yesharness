@@ -154,6 +154,12 @@ pub struct Message {
     /// Images you attached (absolute paths, copied into the project's .yesharness/attachments).
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// What the agent's turn actually did ("ran 2 commands · edited ui.rs · handed off to developer").
+    #[serde(default)]
+    pub receipt: String,
+    /// It said work was happening, but nothing was run, edited or handed off.
+    #[serde(default)]
+    pub idle_claim: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -241,7 +247,7 @@ pub struct Data {
 
 impl Message {
     pub fn system(text: impl Into<String>) -> Self {
-        Message { author: Author::System, text: text.into(), ts: now(), error: false, to_user: false, via: String::new(), attachments: Vec::new() }
+        Message { author: Author::System, text: text.into(), ts: now(), error: false, to_user: false, via: String::new(), attachments: Vec::new(), receipt: String::new(), idle_claim: false }
     }
 }
 

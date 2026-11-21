@@ -2456,6 +2456,16 @@ fn message(ui: &mut egui::Ui, t: &Theme, data: &Data, m: &model::Message, prev: 
                     } else {
                         render_markdown(ui, t, &m.text, 14.0);
                     }
+                    // What the turn really did (from the engine, not the wording).
+                    if m.idle_claim {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new("No action taken: nothing was run, edited or handed off").size(11.5).color(t.amber))
+                            .on_hover_text("The reply sounds like work is happening, but the app saw no commands, file edits or handoffs.");
+                    } else if !m.receipt.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(&m.receipt).size(11.5).color(t.tertiary))
+                            .on_hover_text("What this turn actually did, according to the engine.");
+                    }
                 });
             });
         }
