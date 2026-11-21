@@ -3,6 +3,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The version comes from the git tags (v1.5.0 …): YH_VERSION, else the latest tag, else what's in Cargo.toml.
+VERSION="${YH_VERSION:-$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null | sed 's/^v//')}"
+if [ -n "$VERSION" ]; then
+  echo "› Version $VERSION"
+  BACKUP=$(mktemp -d)
+  cp Cargo.toml Cargo.lock "$BACKUP/" && cp macos/Info.plist "$BACKUP/Info.plist"
+  python3 scripts/bump_version.py --set "$VERSION" >/dev/null
+  # Put the tracked files back afterwards: the version is only for this build.
+  trap 'cp "$BACKUP/Cargo.toml" "$BACKUP/Cargo.lock" . && cp "$BACKUP/Info.plist" macos/Info.plist' EXIT
+fi
+
 echo "› Building app (release)…"
 # Don't bake your home folder path into the binary (it shows up in panic locations).
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~"
