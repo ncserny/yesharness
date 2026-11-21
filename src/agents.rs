@@ -34,6 +34,8 @@ pub struct Receipt {
     pub steps: usize,
     /// Stopped by the app at the step limit.
     pub capped: bool,
+    /// Tool calls the engine's permissions blocked (the agent tried, it wasn't allowed).
+    pub blocked: usize,
 }
 
 /// "140k tokens" / "2.9M tokens"
@@ -129,6 +131,10 @@ fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>,
         // Lean: no global MCP servers to start and describe on every turn.
         cmd.arg("--strict-mcp-config");
     }
+    // Internet (on by default): web search and page fetches don't need "Full access".
+    if agent.internet && !agent.full_access {
+        cmd.arg("--allowedTools=WebSearch,WebFetch");
+    }
     // Step limit (each step re-sends the conversation).
     cmd.args(["--max-turns", &agent.step_cap().to_string()]);
 
@@ -138,7 +144,8 @@ fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>,
             (ctl.status)(st);
         }
     });
-    let receipt = p.receipt.clone();
+    let mut receipt = p.receipt.clone();
+    receipt.blocked = p.denied;
     let mut out = finish("claude", res, p.session, p.result.or(p.last_text), p.is_error, p.denied, ctl);
     out.rate = p.rate;
     out.receipt = receipt;
@@ -237,19 +244,20 @@ fn describe_tool(name: &str, input: &Value) -> String {
 
 /// Instructions for router mode: no tools, one call, decide and answer.
 pub const ROUTER_INSTRUCTIONS: &str = "You are the coordinator of a small team of AI agents in the YesHarness app. \
-In this mode you have NO tools: you can't read files, run commands or browse. You can:\n\
-1. Answer directly when the conversation, the facts and your briefing are enough.\n\
+In this mode you can't read files or run commands, but you can search the web. You can:\n\
+1. Answer directly when the conversation, the facts and your briefing are enough. For quick facts from the web \
+(schedules, news, prices, opening hours, definitions) use web search and answer with what you found.\n\
 2. Hand work to a teammate with a line that starts with \"@name:\" followed by a complete, self-contained brief \
 (goal, where files live, what done looks like). Several such lines hand work to several teammates at once.\n\
 3. Use app actions on their own lines: /new-channel <name> [folder], /send <channel> <message>, /switch <channel>.\n\
-If you must look at the project files or the web yourself to answer, reply with exactly /work on its own line \
+If you must look at the project files or do longer research yourself to answer, reply with exactly /work on its own line \
 and nothing else: you'll then get your full tools for this turn.\n\
 Prefer handing real work to the teammate whose role fits. Be very concise: one or two short sentences. Never say \
 work is happening unless you hand it off in this reply or the facts show it.";
 
 /// Router mode: one cheap Codex call with short instructions and no tools (~12k tokens instead of ~20k per
 /// call, and never a multi-step loop). Stateless: the prompt carries the recent conversation.
-pub fn run_router(folder: &Path, prompt: &str, model: Option<&str>, ctl: &Ctl) -> Outcome {
+pub fn run_router(folder: &Path, prompt: &str, model: Option<&str>, web: bool, ctl: &Ctl) -> Outcome {
     let instr = crate::model::data_file().parent().map(|p| p.join("router-instructions.md")).unwrap_or_else(|| "router-instructions.md".into());
     let _ = std::fs::write(&instr, ROUTER_INSTRUCTIONS);
     let mut cmd = env::command("codex");
@@ -257,6 +265,8 @@ pub fn run_router(folder: &Path, prompt: &str, model: Option<&str>, ctl: &Ctl) -
     cmd.args(["--json", "--skip-git-repo-check", "--ignore-user-config", "--ephemeral"]);
     cmd.args(["-c", &format!("model_instructions_file=\"{}\"", instr.display())]);
     cmd.args(["-c", "sandbox_mode=\"read-only\"", "-c", "model_reasoning_effort=\"low\""]);
+    // Live web search: Codex's built-in tool (no shell), so quick questions get answered in this one call.
+    cmd.args(["-c", if web { "web_search=\"live\"" } else { "web_search=\"disabled\"" }]);
     for f in ["shell_tool", "unified_exec", "apps", "plugins", "goals", "image_generation", "view_image", "tool_suggest"] {
         cmd.args(["--disable", f]);
     }
@@ -320,6 +330,10 @@ fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, 
             // Without this the sandbox blocks all network access (no curl, whois, npm install, APIs).
             cmd.args(["-c", "sandbox_workspace_write.network_access=true"]);
         }
+    }
+    // Live web search (Codex's built-in tool; local models don't have it).
+    if agent.internet && !local {
+        cmd.args(["-c", "web_search=\"live\""]);
     }
     if let Some(m) = model {
         cmd.args(["-m", m]);
