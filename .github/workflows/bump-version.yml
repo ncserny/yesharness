@@ -1,7 +1,8 @@
 name: Bump version on merge
 
-# Every merged pull request into main bumps the version by 0.1 (0.2.0 -> 0.3.0, 0.9.0 -> 1.0.0),
-# commits and tags it (v0.3.0, ...), then publishes a GitHub release with the macOS app.
+# Every merged pull request into main gets the next version (+0.1: v1.4.0 -> v1.5.0, v1.9.0 -> v2.0.0) as a
+# git tag on its merge commit, and a GitHub release with the macOS app built from that tag. The version
+# lives in the tags, so nothing is pushed to main: it works with main protected (pull requests only).
 # Add the label "no-bump" to a PR to skip.
 on:
   pull_request:
@@ -11,42 +12,39 @@ on:
 permissions:
   contents: write
 
-# No concurrency group: GitHub keeps only one waiting run per group and cancels the others, which
-# dropped a merge's version once. Instead, each run retries on top of the latest main (below).
-
 jobs:
   bump:
     if: github.event.pull_request.merged == true && !contains(github.event.pull_request.labels.*.name, 'no-bump')
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.bump.outputs.version }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
-      - name: Bump by 0.1, commit, tag and push (retries if another merge got there first)
-        id: bump
+      - name: Tag the merge with the next version (retries if another merge took it first)
+        id: tag
         env:
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
           PR: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for attempt in 1 2 3 4 5 6 7 8; do
-            git fetch -q origin main --tags
-            git reset -q --hard origin/main
-            VERSION=$(python3 scripts/bump_version.py)
-            git commit -qam "Version $VERSION (after PR #$PR)"
-            git tag -a "v$VERSION" -m "YesHarness $VERSION"
-            # Atomic: the tag only lands together with the commit.
-            if git push --atomic origin HEAD:main "v$VERSION"; then
+            git fetch -q --tags --force origin
+            LATEST=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+            VERSION=$(python3 scripts/bump_version.py --next "${LATEST:-v0.0.0}")
+            git tag -a "v$VERSION" "$SHA" -m "YesHarness $VERSION: $TITLE (#$PR)"
+            if git push origin "v$VERSION"; then
               echo "version=$VERSION" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             git tag -d "v$VERSION"
             sleep $((attempt * 7))
           done
-          echo "Couldn't push the version bump" >&2
+          echo "Couldn't push a version tag" >&2
           exit 1
 
   release:
@@ -61,6 +59,7 @@ jobs:
       - name: Build the app
         env:
           RUSTUP_TOOLCHAIN: 1.88.0
+          YH_VERSION: ${{ needs.bump.outputs.version }}
         run: |
           bash scripts/bundle.sh
           codesign --verify --deep --strict dist/YesHarness.app
