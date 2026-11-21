@@ -30,16 +30,31 @@ final class Parakeet {
     static let maxUtterance = rate * 28
 
     func setup() async {
+        // Already on disk? Then we're only loading it (a few seconds, longer right after an update).
+        let dir = AsrModels.defaultCacheDirectory(for: .ultra)
+        let onDisk = FileManager.default.fileExists(atPath: dir.appendingPathComponent("Encoder.mlmodelc").path)
         let notice = Task {
-            try await Task.sleep(nanoseconds: 1_200_000_000)
-            out("I:Downloading Parakeet Ultra (one time, ~0.7 GB)…")
+            try await Task.sleep(nanoseconds: 800_000_000)
+            out(onDisk ? "I:Loading Parakeet Ultra…" : "I:Downloading Parakeet Ultra… 0% (of ~0.7 GB)")
         }
         do {
             let models = try await AsrModels.downloadAndLoad(
                 version: .ultra,
                 progressHandler: { p in
-                    let pct = Int(p.fractionCompleted * 100)
-                    if pct > 0 && pct < 100 { out("I:Downloading Parakeet Ultra… \(pct)%") }
+                    // Already downloaded: FluidAudio still walks its phases while checking files; just say "Loading".
+                    if onDisk { return }
+                    // FluidAudio: the first half of the fraction is the download (by bytes), the second compiling.
+                    switch p.phase {
+                    case .listing:
+                        out("I:Downloading Parakeet Ultra… 0% (of ~0.7 GB)")
+                    case .downloading:
+                        let pct = min(99, max(0, Int(p.fractionCompleted / 0.5 * 100)))
+                        let gb = Double(pct) / 100 * 0.7
+                        out(String(format: "I:Downloading Parakeet Ultra… %d%% (%.2f of ~0.7 GB)", pct, gb))
+                    case .compiling:
+                        let pct = min(99, max(0, Int((p.fractionCompleted - 0.5) / 0.5 * 100)))
+                        out("I:Preparing Parakeet Ultra for the Neural Engine… \(pct)%")
+                    }
                 }
             )
             notice.cancel()

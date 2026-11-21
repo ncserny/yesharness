@@ -114,7 +114,7 @@ pub fn setup_parakeet(repaint: impl Fn() + Send + 'static) {
                         if i == "ready" {
                             ok = true;
                         } else {
-                            SETUP.lock().unwrap().status = i.replace("Downloading", "Setting up");
+                            SETUP.lock().unwrap().status = i.to_string();
                         }
                     } else if let Some(e) = line.strip_prefix("E:") {
                         error = Some(e.to_string());
