@@ -527,7 +527,7 @@ impl eframe::App for App {
                         if icon_button(ui, &t, Icon::Plus, 22.0, false, "New channel").clicked() {
                             self.new_channel = Some(NewChannel {
                                 name: String::new(),
-                                folder: model::home_dir(),
+                                folder: model::projects_dir(),
                                 members: data.agents.iter().map(|a| a.id.clone()).collect(),
                             });
                         }

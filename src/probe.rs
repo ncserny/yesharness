@@ -78,6 +78,9 @@ impl Health {
     }
 }
 
+/// Codex models picked automatically before Codex's own default, cheapest-that's-good-enough first.
+const CODEX_PREFERRED: [&str; 1] = ["gpt-6-sol"];
+
 /// Claude/Codex share one account per kind; custom agents are tracked one by one.
 pub fn key(a: &Agent) -> String {
     match a.kind {
@@ -97,10 +100,12 @@ pub fn pick_model(agent: &Agent, h: Option<&Health>) -> Option<String> {
         AgentKind::Codex => {
             let ok = |m: &&ModelInfo| !h.bad_models.contains(&m.id);
             // Passing the model explicitly also fixes a broken `model =` in ~/.codex/config.toml.
+            // Preferred: GPT-6-Sol, much cheaper on your quota than the default (Astra); then Codex's default.
             h.models
                 .iter()
                 .filter(ok)
-                .find(|m| m.is_default)
+                .find(|m| CODEX_PREFERRED.contains(&m.id.as_str()))
+                .or_else(|| h.models.iter().filter(ok).find(|m| m.is_default))
                 .or_else(|| h.models.iter().filter(ok).find(|m| !m.hidden))
                 .map(|m| m.id.clone())
         }
@@ -490,6 +495,19 @@ mod tests {
         let h = probe(AgentKind::Local);
         assert!(h.available(), "{h:?}");
         assert!(!h.models.is_empty());
+    }
+
+    #[test]
+    fn codex_prefers_sol_over_the_default() {
+        let mut h = Health { installed: true, logged_in: Some(true), ..Default::default() };
+        h.models = vec![
+            ModelInfo { id: "gpt-6-astra".into(), is_default: true, ..Default::default() },
+            ModelInfo { id: "gpt-6-sol".into(), ..Default::default() },
+        ];
+        let agent = crate::model::Data::default().agents[1].clone();
+        assert_eq!(pick_model(&agent, Some(&h)).as_deref(), Some("gpt-6-sol"));
+        h.bad_models.push("gpt-6-sol".into());
+        assert_eq!(pick_model(&agent, Some(&h)).as_deref(), Some("gpt-6-astra"), "falls back to the default");
     }
 
     #[test]

@@ -275,6 +275,20 @@ pub fn home_dir() -> String {
     dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".into())
 }
 
+/// ~/YesHarness: the folder for #general (never the whole home folder: agents would search everything,
+/// which is slow and burns quota). Created on demand.
+pub fn general_dir() -> String {
+    let dir = format!("{}/YesHarness", home_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Where the New Channel sheet starts: ~/Development if you have one, else ~/YesHarness.
+pub fn projects_dir() -> String {
+    let dev = format!("{}/Development", home_dir());
+    if std::path::Path::new(&dev).is_dir() { dev } else { general_dir() }
+}
+
 /// Starter roles. Each is a briefing on top of an engine; you can switch the engine or model any time.
 pub struct Template {
     pub title: &'static str,
@@ -381,7 +395,7 @@ impl Default for Data {
         let general = Channel {
             id: new_id(),
             name: "general".into(),
-            folder: home_dir(),
+            folder: general_dir(),
             members: agents.iter().map(|a| a.id.clone()).collect(),
             messages: vec![Message::system(
                 "Welcome to your workspace. Send a message to your main agent; it brings in the right teammates. \
