@@ -21,6 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
+/// Tokens one message may use across all agents before the app pauses it (you can say "continue").
+const TOKEN_BUDGET: u64 = 800_000;
+
 /// Max agent turns per user message, so agents can't ping-pong forever.
 const MAX_TURNS: u32 = 10;
 /// Max nesting of delegations (A asks B asks C ...).
@@ -289,6 +292,8 @@ struct Turns {
     answered: Vec<String>,
     /// Empty promises we've already sent back once.
     nudges: u32,
+    /// Tokens used for this message so far, across all agents.
+    tokens: u64,
 }
 
 fn handle(shared: &Arc<Shared>, cid: &str, text: &str) {
@@ -307,7 +312,7 @@ fn handle(shared: &Arc<Shared>, cid: &str, text: &str) {
     if targets.is_empty() {
         targets.push(members[0].id.clone());
     }
-    let turns = Mutex::new(Turns { budget: MAX_TURNS, failed: Vec::new(), answered: Vec::new(), nudges: 0 });
+    let turns = Mutex::new(Turns { budget: MAX_TURNS, failed: Vec::new(), answered: Vec::new(), nudges: 0, tokens: 0 });
     for t in targets {
         if shared.cancelled(cid) {
             break;
@@ -646,6 +651,12 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         }
         receipt.push_str("app action");
     }
+    // Per-message token budget: past it, no more handoffs, follow-ups or retries for this message.
+    let over_budget = {
+        let mut t = turns.lock().unwrap();
+        t.tokens += out.receipt.tokens;
+        t.tokens > TOKEN_BUDGET
+    };
     let idle_claim = !out.error && !out.receipt.did_work() && delegates.is_empty() && actions.is_empty() && claims_work(&shown, &members);
 
     let to_user = matches!(mode, Mode::User | Mode::FollowUp | Mode::Nudge) && !out.error;
@@ -697,6 +708,20 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
                 shared.post(cid, Author::System, format!("{} is taking over.", sub.name()), false);
                 turn(shared, cid, &sub.id, Mode::User, turns, depth);
             }
+        }
+        return;
+    }
+    if over_budget {
+        let used = turns.lock().unwrap().tokens;
+        let first = !turns.lock().unwrap().failed.iter().any(|f| f == "__budget");
+        if first {
+            turns.lock().unwrap().failed.push("__budget".into());
+            shared.post(
+                cid,
+                Author::System,
+                format!("Paused this request at {} to save your quota. Say \"continue\" to keep going.", agents::tokens_label(used)),
+                false,
+            );
         }
         return;
     }
@@ -1319,6 +1344,13 @@ mod tests {
         let g = data.agents.iter().find(|a| a.handle == "general").expect("General created");
         assert!(data.channels[0].members.contains(&g.id));
         assert_eq!(g.kind, AgentKind::Custom, "runs on the main agent's engine");
+    }
+
+    #[test]
+    fn step_caps_by_role() {
+        let d = Data::default();
+        assert_eq!(d.agents[0].step_cap(), 8, "main agent routes, it shouldn't investigate");
+        assert_eq!(d.agents[1].step_cap(), 30);
     }
 
     #[test]

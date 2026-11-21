@@ -78,6 +78,16 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Most tool steps one turn may take. Every step re-sends the whole conversation, so long loops get
+    /// expensive fast. The main agent should route, not investigate.
+    pub fn step_cap(&self) -> usize {
+        match self.handle.as_str() {
+            "main" => 8,
+            "general" => 15,
+            _ => 30,
+        }
+    }
+
     pub fn name(&self) -> &str {
         if self.display_name.trim().is_empty() { &self.handle } else { &self.display_name }
     }

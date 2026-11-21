@@ -44,6 +44,11 @@ hands it out to the specialists, then tells you how it went.
 - **Nobody waits:** each message is handled right away, even while teammates work on earlier ones. An agent runs
   one turn at a time; if the one needed is busy, a **General helper** steps in. It's created automatically, runs
   on the main agent's engine, and starts extra copies (up to four) when it's busy too.
+- **Token limits:** every tool step re-sends the whole conversation, so long loops get expensive fast.
+  - **Steps per turn:** Alex stops after 8 steps (it should hand work off, not investigate), General after 15,
+    specialists after 30.
+  - **Context size:** command output is trimmed to ~4k tokens, and Codex compacts the conversation past 60k.
+  - **Per message:** once a request has used 800k tokens, it pauses. Say "continue" to go on.
 - **Parallel handoffs:** when the main agent briefs several teammates in one message, they work at the
   same time, and the chat shows everyone who's working and what they're doing.
 - **Speed settings per agent** (Team → Engine):

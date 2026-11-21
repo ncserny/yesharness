@@ -30,6 +30,10 @@ pub struct Receipt {
     pub lookups: usize,
     /// Tokens the engine reported for this turn (input incl. cached + output): what eats your quota.
     pub tokens: u64,
+    /// Every tool step (each one re-sends the whole conversation).
+    pub steps: usize,
+    /// Stopped by the app at the step limit.
+    pub capped: bool,
 }
 
 /// "140k tokens" / "2.9M tokens"
@@ -70,6 +74,9 @@ impl Receipt {
             0 => {}
             1 => parts.push("1 lookup".to_string()),
             n => parts.push(format!("{n} lookups")),
+        }
+        if self.capped {
+            parts.push("stopped at its step limit".to_string());
         }
         if self.tokens > 0 {
             parts.push(tokens_label(self.tokens));
@@ -122,6 +129,8 @@ fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>,
         // Lean: no global MCP servers to start and describe on every turn.
         cmd.arg("--strict-mcp-config");
     }
+    // Step limit (each step re-sends the conversation).
+    cmd.args(["--max-turns", &agent.step_cap().to_string()]);
 
     let mut p = ClaudeParser::default();
     let res = stream(cmd, None, ctl, |line| {
@@ -172,6 +181,7 @@ impl ClaudeParser {
                         }
                         Some("tool_use") => {
                             let name = c["name"].as_str().unwrap_or("tool");
+                            self.receipt.steps += 1;
                             match name {
                                 "Bash" => self.receipt.commands += 1,
                                 "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
@@ -244,6 +254,8 @@ fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, 
     if !agent.effort.is_empty() {
         cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", agent.effort)]);
     }
+    // Keep the context small: every step re-sends it. Trim long command output, compact long conversations.
+    cmd.args(["-c", "tool_output_token_limit=4000", "-c", "model_auto_compact_token_limit=60000"]);
     for img in images.iter().filter(|p| Path::new(p).is_file()) {
         cmd.args(["-i", img]);
     }
@@ -265,11 +277,32 @@ fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, 
     cmd.arg(prompt);
 
     let mut p = CodexParser::default();
+    let cap = agent.step_cap();
     let res = stream(cmd, None, ctl, |line| {
         if let Some(st) = p.feed(line) {
             (ctl.status)(st);
         }
+        // Step limit: Codex has no flag for it, so end the run (its session keeps what was done).
+        if p.receipt.steps > cap && !p.receipt.capped {
+            p.receipt.capped = true;
+            (ctl.status)(format!("stopping: reached {cap} steps"));
+            if let Some(pid) = *ctl.pid.lock().unwrap() {
+                env::kill_tree(pid);
+            }
+        }
     });
+    if p.receipt.capped {
+        let note = format!(
+            "_(Stopped after {cap} steps to save your quota. Say \"continue\" if it should keep going.)_"
+        );
+        let text = match &p.last_text {
+            Some(t) => format!("{t}\n\n{note}"),
+            None => format!("I hadn't finished yet. {note}"),
+        };
+        let mut out = Outcome { text, session: p.thread.clone(), error: false, rate: None, receipt: Receipt::default() };
+        out.receipt = p.receipt;
+        return out;
+    }
     let is_error = p.error.is_some() && p.last_text.is_none();
     let text = if is_error { p.error.clone() } else { p.last_text.clone() };
     let mut out = finish(if local { "codex (local)" } else { "codex" }, res, p.thread, text, is_error, 0, ctl);
@@ -296,6 +329,11 @@ impl CodexParser {
             "item.started" | "item.updated" | "item.completed" => {
                 let item = &v["item"];
                 let done = v["type"] == "item.completed";
+                if v["type"] == "item.started"
+                    && matches!(item["type"].as_str(), Some("command_execution" | "file_change" | "mcp_tool_call" | "web_search"))
+                {
+                    self.receipt.steps += 1;
+                }
                 if done {
                     match item["type"].as_str().unwrap_or("") {
                         "command_execution" => self.receipt.commands += 1,
@@ -579,6 +617,10 @@ mod tests {
         assert_eq!(c.receipt.summary(), "ran 1 command · edited ui.rs, README.md");
         c.feed(r#"{"type":"turn.completed","usage":{"input_tokens":139500,"cached_input_tokens":120000,"output_tokens":800}}"#);
         assert_eq!(c.receipt.summary(), "ran 1 command · edited ui.rs, README.md · 140k tokens");
+        let mut s = CodexParser::default();
+        s.feed(r#"{"type":"item.started","item":{"type":"command_execution","command":"ls"}}"#);
+        s.feed(r#"{"type":"item.started","item":{"type":"agent_message","text":"x"}}"#);
+        assert_eq!(s.receipt.steps, 1, "only tool steps count");
         assert!(c.receipt.did_work());
 
         let mut cl = ClaudeParser::default();
