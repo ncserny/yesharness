@@ -251,6 +251,10 @@ fn run_codex(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, 
         cmd.arg("--dangerously-bypass-approvals-and-sandbox");
     } else {
         cmd.args(["-c", "sandbox_mode=\"workspace-write\""]);
+        if agent.internet {
+            // Without this the sandbox blocks all network access (no curl, whois, npm install, APIs).
+            cmd.args(["-c", "sandbox_workspace_write.network_access=true"]);
+        }
     }
     if let Some(m) = model {
         cmd.args(["-m", m]);

@@ -130,6 +130,8 @@ when the app is in the background, and reads a short summary aloud. Click "♥ c
 - **Permissions** (Agents settings):
   - Claude without full access can edit files, but its shell commands are blocked.
   - Codex without full access runs sandboxed to the project folder.
+  - **Internet** (on by default): agents can use the network inside their sandbox (curl, whois, package
+    installs, APIs). File edits stay limited to the project folder.
   - "Full access" removes these limits. Only turn it on for projects you trust.
 - **Custom agents:** any command works. The prompt is sent on stdin, and whatever the command prints is the reply.
 

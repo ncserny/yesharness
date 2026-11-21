@@ -1200,6 +1200,7 @@ mod tests {
             voice: String::new(),
             effort: String::new(),
             use_my_plugins: false,
+            internet: true,
             color: [0, 0, 0],
         }
     }
@@ -1284,11 +1285,16 @@ mod tests {
             "lead",
             r#"input=$(cat); if printf '%s' "$input" | grep -q 'have replied above'; then echo "All done"; elif printf '%s' "$input" | grep -q 'quick question'; then echo "quick answer"; else echo "@helper: slow task"; fi"#,
         );
-        let helper = agent("H", "helper", r#"cat >/dev/null; sleep 3; echo "slow done""#);
+        let helper = agent("H", "helper", r#"cat >/dev/null; sleep 4; echo "slow done""#);
         let data = Data { agents: vec![lead, helper], channels: vec![channel(&["L", "H"])], selected: None, settings: Default::default() };
         let shared = Shared::quiet(data);
         send(&shared, "c", "do the slow thing".into());
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        // Wait until the slow task has actually been handed off (the lead's first turn is done).
+        let t = Instant::now();
+        while !shared.data.lock().unwrap().channels[0].messages.iter().any(|m| m.text.contains("@helper: slow task")) {
+            assert!(t.elapsed().as_secs() < 10, "lead never handed off");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         send(&shared, "c", "quick question: is the domain free?".into());
         let msgs = wait(&shared);
         let pos = |t: &str| msgs.iter().position(|(_, m)| m == t).unwrap_or_else(|| panic!("missing {t}: {msgs:#?}"));

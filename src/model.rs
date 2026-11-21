@@ -71,6 +71,9 @@ pub struct Agent {
     /// Load your global Claude/Codex plugins and MCP servers. Off = lean and faster.
     #[serde(default)]
     pub use_my_plugins: bool,
+    /// Internet inside the sandbox (curl, whois, package installs, APIs). File edits stay limited to the project.
+    #[serde(default = "yes")]
+    pub internet: bool,
     pub color: [u8; 3],
 }
 
@@ -393,6 +396,7 @@ impl Template {
             // The main agent mostly routes and summarizes: quick thinking keeps the conversation snappy.
             effort: if self.handle == "main" { "low".into() } else { String::new() },
             use_my_plugins: false,
+            internet: true,
             color,
         }
     }

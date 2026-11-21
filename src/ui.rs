@@ -2201,6 +2201,18 @@ impl App {
                                     });
                                 }
                                 form_sep(ui, t);
+                                form_row(ui, t, "Internet", |ui| {
+                                    toggle(ui, t, &mut a.internet);
+                                    let note = if a.kind == AgentKind::Claude {
+                                        "Web tools always work; shell commands need Full access"
+                                    } else if a.internet {
+                                        "Can use the web (curl, whois, installs) inside its sandbox"
+                                    } else {
+                                        "Offline: no network inside its sandbox"
+                                    };
+                                    ui.label(RichText::new(note).size(12.0).color(t.secondary));
+                                });
+                                form_sep(ui, t);
                                 form_row(ui, t, "Full access", |ui| {
                                     toggle(ui, t, &mut a.full_access);
                                     let note = match (a.kind, a.full_access) {
