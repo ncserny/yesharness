@@ -521,6 +521,13 @@ pub fn you_note(name: &str, work: &str, projects: &str, languages: &[&str], answ
     t
 }
 
+/// Your first name, from the About you note.
+pub fn your_name() -> Option<String> {
+    let you = read_you()?;
+    let line = you.lines().find_map(|l| l.trim().strip_prefix("- Name:"))?;
+    line.split_whitespace().next().map(String::from)
+}
+
 /// For prompts: what you told the app about yourself.
 pub fn you_section() -> String {
     let Some(you) = read_you() else { return String::new() };

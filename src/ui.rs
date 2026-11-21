@@ -523,6 +523,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// The window's own background shows through between panels; make it ours, not near-black.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.shutdown();
     }
@@ -725,7 +730,7 @@ impl eframe::App for App {
                         }
                     }
                     ui.add_space(4.0);
-                    section_label(ui, &t, "Team");
+                    section_label(ui, &t, "Your team");
                 });
             });
 
@@ -843,7 +848,7 @@ impl eframe::App for App {
                                 .id(id)
                                 .frame(false)
                                 .font(FontId::proportional(14.0))
-                                .hint_text(RichText::new(format!("Message #{channel_name}   (Shift+Enter for a new line)")).color(t.tertiary))
+                                .hint_text(RichText::new(format!("Talk to me, or type here…   (#{channel_name})")).color(t.tertiary))
                                 .desired_rows(1)
                                 .desired_width(middle_w),
                         );
@@ -934,8 +939,13 @@ impl eframe::App for App {
         // ------------------------------------------------ header
         egui::TopBottomPanel::top("header")
             .exact_height(62.0)
+            .resizable(false)
+            .show_separator_line(false)
             .frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(20, 0)))
             .show(ctx, |ui| {
+                // A soft hairline instead of the hard panel edge.
+                let edge = ui.max_rect();
+                ui.painter().hline(edge.left() - 20.0..=edge.right() + 20.0, edge.bottom() - 0.5, Stroke::new(1.0_f32, t.separator));
                 window_drag(ui, ui.max_rect(), "header-drag");
                 let memory_on = data.settings.memory;
                 let Data { agents, channels, selected, .. } = &mut *data;
@@ -958,7 +968,7 @@ impl eframe::App for App {
                             self.renaming = None;
                         }
                     } else {
-                        ui.label(RichText::new(&ch.name).size(15.5).color(t.strong));
+                        ui.label(RichText::new(&ch.name).font(FontId::new(18.0, egui::FontFamily::Name("serif".into()))).color(t.strong));
                     }
                     let folder = ui
                         .add(egui::Label::new(RichText::new(short_path(&ch.folder)).size(12.0).color(t.tertiary)).sense(Sense::click()))
@@ -1071,6 +1081,12 @@ impl eframe::App for App {
         // ------------------------------------------------ conversation
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg)).show(ctx, |ui| {
             let Some(ch) = data.channel(&cid) else { return };
+            // A little warm light in the room.
+            let room = ui.max_rect();
+            let glow = if t.dark { 26 } else { 34 };
+            crate::welcome::soft_circle(ui.painter(), room.right_top() + vec2(-room.width() * 0.15, room.height() * 0.1), room.width() * 0.45, Color32::from_rgba_unmultiplied(255, 170, 130, glow));
+            crate::welcome::soft_circle(ui.painter(), room.left_bottom() + vec2(room.width() * 0.1, -room.height() * 0.05), room.width() * 0.4, Color32::from_rgba_unmultiplied(246, 160, 196, glow - 8));
+            let lead = data.members(ch).into_iter().next();
             ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 let full = ui.available_width();
                 let w = (full - 48.0).min(740.0);
@@ -1079,12 +1095,32 @@ impl eframe::App for App {
                     ui.vertical(|ui| {
                         ui.set_width(w);
                         ui.add_space(12.0);
-                        if ch.messages.is_empty() {
-                            ui.add_space(80.0);
+                        // Your pal says hello at the top of every conversation.
+                        {
+                            let empty = ch.messages.is_empty();
+                            if empty {
+                                ui.add_space(70.0);
+                            }
+                            let (name, color_of, initial) = lead
+                                .as_ref()
+                                .map(|a| (a.name().to_string(), color(a.color), a.name().chars().next().unwrap_or('A')))
+                                .unwrap_or_else(|| ("Alex".into(), t.accent, 'A'));
+                            let size = if empty { 34.0 } else { 22.0 };
                             ui.vertical_centered(|ui| {
-                                ui.label(RichText::new("Just start talking.").size(20.0).color(t.strong));
-                                ui.label(RichText::new("The main agent listens and brings in the team.").color(t.secondary));
+                                let (r, _) = ui.allocate_exact_size(vec2(size * 4.0, size * 2.6), Sense::hover());
+                                let time = ui.input(|i| i.time) as f32;
+                                let talking = if voice::speaking() { 1.0 } else { 0.0 };
+                                crate::welcome::orb(ui.painter(), r.center(), size, color_of, t.accent, time, talking, 0.0, initial);
+                                let you = crate::memory::your_name().map(|n| format!(", {n}")).unwrap_or_default();
+                                ui.label(RichText::new(format!("{}{you}.", greeting())).font(FontId::new(if empty { 28.0 } else { 21.0 }, egui::FontFamily::Name("serif".into()))).color(t.strong));
+                                let line = if empty {
+                                    format!("I'm {name}. Tell me what you need, and I'll take care of it with the team.")
+                                } else {
+                                    format!("{name} is here whenever you need anything. Just talk.")
+                                };
+                                ui.label(RichText::new(line).size(13.0).color(t.secondary));
                             });
+                            ui.add_space(if empty { 0.0 } else { 18.0 });
                         }
                         // Long conversations stay fast: only the latest messages are laid out.
                         const RECENT: usize = 150;
@@ -1646,6 +1682,22 @@ fn store_attachments(folder: &str, files: &[std::path::PathBuf]) -> Vec<String> 
         .collect()
 }
 
+/// "Good morning" / "Good afternoon" / "Good evening", by the clock on your Mac.
+fn greeting() -> &'static str {
+    static HOUR: std::sync::Mutex<Option<(Instant, u32)>> = std::sync::Mutex::new(None);
+    let mut h = HOUR.lock().unwrap();
+    if h.is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(300)) {
+        let hour = std::process::Command::new("date").arg("+%H").output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(12);
+        *h = Some((Instant::now(), hour));
+    }
+    match h.map(|(_, hr)| hr).unwrap_or(12) {
+        5..=11 => "Good morning",
+        12..=17 => "Good afternoon",
+        18..=22 => "Good evening",
+        _ => "Hey there, night owl",
+    }
+}
+
 /// A small rounded label in the header.
 fn chip(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32, tip: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.0), fg);
@@ -1786,10 +1838,15 @@ fn mic_orb(ui: &mut egui::Ui, t: &Theme, listening: bool, level: f32, hands_free
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
     let c = rect.center();
     let p = ui.painter();
-    let base = if listening && !hands_free { t.red } else if listening { t.accent } else { t.tertiary };
+    // Always warm: your pal's button. Breathes gently while idle, glows with your voice while listening.
+    let base = if listening && !hands_free { t.red } else { t.accent };
+    let time = ui.input(|i| i.time) as f32;
     if listening {
         p.circle_filled(c, size / 2.0 + 2.0 + level * 10.0, base.gamma_multiply(0.18));
+    } else {
+        crate::welcome::soft_circle(p, c, size * (0.85 + 0.05 * (time * 1.4).sin()), base.gamma_multiply(0.35));
     }
+    let base = if listening { base } else { base.gamma_multiply(0.82) };
     let fill = if resp.hovered() { base.gamma_multiply(0.9) } else { base };
     p.circle_filled(c, size / 2.0, fill);
     icons::paint(p, Icon::Mic, Rect::from_center_size(c, Vec2::splat(20.0)), Color32::WHITE);

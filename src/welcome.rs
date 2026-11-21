@@ -529,7 +529,7 @@ fn backdrop(p: &egui::Painter, r: Rect, pal: &Palette, t: f32) {
 }
 
 /// A circle that fades to transparent at its edge.
-fn soft_circle(p: &egui::Painter, c: Pos2, radius: f32, color: Color32) {
+pub fn soft_circle(p: &egui::Painter, c: Pos2, radius: f32, color: Color32) {
     let mut m = Mesh::default();
     let n = 48;
     m.colored_vertex(c, color);
@@ -544,18 +544,24 @@ fn soft_circle(p: &egui::Painter, c: Pos2, radius: f32, color: Color32) {
 }
 
 fn draw_orb(p: &egui::Painter, c: Pos2, color: Color32, pal: &Palette, t: f32, talking: f32, hearing: f32) {
+    orb(p, c, 46.0, color, pal.accent, t, talking, hearing, 'A');
+}
+
+/// Alex as a softly breathing orb (radius `size`): ripples while talking, glows while hearing you.
+#[allow(clippy::too_many_arguments)]
+pub fn orb(p: &egui::Painter, c: Pos2, size: f32, color: Color32, ripple: Color32, t: f32, talking: f32, hearing: f32, initial: char) {
     let breathe = 1.0 + 0.03 * (t * 1.6).sin();
-    let r = 46.0 * breathe;
+    let r = size * breathe;
     soft_circle(p, c, r * (2.0 + hearing * 0.8), color.gamma_multiply(0.35 + hearing * 0.3));
     if talking > 0.0 {
         for k in 0..3 {
             let phase = ((t * 0.9 + k as f32 / 3.0) % 1.0) as f32;
-            p.circle_stroke(c, r + 8.0 + phase * 46.0, Stroke::new(2.0_f32, pal.accent.gamma_multiply(0.55 * (1.0 - phase))));
+            p.circle_stroke(c, r + r * 0.17 + phase * r, Stroke::new(2.0_f32, ripple.gamma_multiply(0.55 * (1.0 - phase))));
         }
     }
     p.circle_filled(c, r, color);
     soft_circle(p, c - vec2(r * 0.3, r * 0.34), r * 0.75, Color32::from_rgba_unmultiplied(255, 255, 255, 60));
-    p.text(c + vec2(0.0, 1.0), Align2::CENTER_CENTER, "A", FontId::new(r * 0.95, FontFamily::Name("serif".into())), Color32::WHITE);
+    p.text(c + vec2(0.0, 1.0), Align2::CENTER_CENTER, initial.to_uppercase().to_string(), FontId::new(r * 0.95, FontFamily::Name("serif".into())), Color32::WHITE);
 }
 
 /// Rounded choices; returns the one tapped.
