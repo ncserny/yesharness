@@ -1373,19 +1373,29 @@ mod tests {
     /// A command line for a stand-in agent that works on every OS (examples/fake_agent.rs): the first
     /// (needle, reply) whose needle is in the prompt wins; "" always matches; "sleep=N;" waits first.
     fn fake(rules: &[(&str, &str)]) -> String {
-        // The test binary lives under target/<profile>/ (deps/ or build/…); examples land in target/<profile>/examples.
-        let name = format!("fake_agent{}", std::env::consts::EXE_SUFFIX);
-        let exe = std::env::current_exe().unwrap();
-        let bin = exe
-            .ancestors()
-            .map(|d| d.join("examples").join(&name))
-            .find(|p| p.is_file())
-            .unwrap_or_else(|| panic!("examples/fake_agent isn't built (cargo test builds it); looked above {}", exe.display()));
+        let bin = fake_agent_bin();
         let mut cmd = format!("\"{}\"", bin.display());
         for (needle, reply) in rules {
             cmd.push_str(&format!(" \"{needle}=>{reply}\""));
         }
         cmd
+    }
+
+    /// Builds examples/fake_agent once (cargo knows exactly where it puts it, whatever its version or layout).
+    fn fake_agent_bin() -> &'static std::path::Path {
+        static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BIN.get_or_init(|| {
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+            let out = std::process::Command::new(cargo)
+                .args(["build", "--quiet", "--example", "fake_agent", "--message-format=json"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .expect("run cargo to build examples/fake_agent");
+            let path = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find_map(|m| {
+                (m["reason"] == "compiler-artifact" && m["target"]["name"] == "fake_agent").then(|| m["executable"].as_str().map(PathBuf::from)).flatten()
+            });
+            path.unwrap_or_else(|| panic!("couldn't build examples/fake_agent: {}", String::from_utf8_lossy(&out.stderr)))
+        })
     }
 
     fn channel(members: &[&str]) -> Channel {
