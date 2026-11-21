@@ -2838,7 +2838,7 @@ mod tests {
         std::fs::write(&src, b"png").unwrap();
         let stored = store_attachments(proj.to_str().unwrap(), std::slice::from_ref(&src));
         assert_eq!(stored.len(), 1);
-        assert!(stored[0].starts_with(proj.join(".yesharness/attachments").to_str().unwrap()), "{stored:?}");
+        assert!(std::path::Path::new(&stored[0]).starts_with(proj.join(".yesharness").join("attachments")), "{stored:?}");
         assert!(std::path::Path::new(&stored[0]).is_file());
         assert!(std::fs::read_to_string(proj.join(".yesharness/.gitignore")).unwrap().contains('*'));
         assert!(is_image(&src) && !is_image(std::path::Path::new("notes.txt")));

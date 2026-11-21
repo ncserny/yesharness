@@ -454,11 +454,17 @@ fn run_custom(agent: &Agent, folder: &Path, prompt: &str, ctl: &Ctl) -> Outcome 
     if agent.command.trim().is_empty() {
         return Outcome { text: "This agent has no command set. Open Agents settings and add one.".into(), session: None, error: true, rate: None, receipt: Receipt::default() };
     }
-    let mut cmd = if cfg!(windows) {
+    // Windows: hand the command line to cmd.exe exactly as written (Rust's own argument quoting would escape
+    // quotes with backslashes, which cmd doesn't understand). /S: strip just the outer quotes we add.
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
         let mut c = env::command("cmd");
-        c.args(["/C", &agent.command]);
+        c.raw_arg(format!("/S /C \"{}\"", agent.command));
         c
-    } else {
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
         let mut c = env::command("sh");
         c.args(["-c", &agent.command]);
         c
