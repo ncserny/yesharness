@@ -1317,38 +1317,40 @@ pub fn user_mentions(text: &str, members: &[Agent]) -> Vec<String> {
 }
 
 /// "Codex, run the tests" / "Hey Claude and Codex, …" / "Everyone: status?"
+/// Only a real address counts: the name(s) at the start, followed by a comma or colon. "All right, that's
+/// good" or "Team work makes…" go to the main agent like everything else.
 fn spoken_address(text: &str, members: &[Agent]) -> Vec<String> {
-    let words: Vec<String> = text
-        .split(|c: char| c.is_whitespace())
-        .take(6)
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').to_lowercase())
-        .filter(|w| !w.is_empty())
-        .collect();
+    let raw: Vec<&str> = text.split_whitespace().take(8).collect();
+    let word = |r: &str| r.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').to_lowercase();
+    let addressed = |r: &str| r.ends_with(',') || r.ends_with(':') || r.ends_with('—');
     let mut i = 0;
-    while i < words.len() && ["hey", "hi", "ok", "okay", "so", "and", "yo", "hello"].contains(&words[i].as_str()) {
+    while i < raw.len() && ["hey", "hi", "ok", "okay", "so", "and", "yo", "hello"].contains(&word(raw[i]).as_str()) {
         i += 1;
     }
-    if i < words.len() && ["everyone", "everybody", "all", "team", "guys"].contains(&words[i].as_str()) {
+    if i < raw.len() && ["everyone", "everybody", "team"].contains(&word(raw[i]).as_str()) && addressed(raw[i]) {
         return members.iter().map(|a| a.id.clone()).collect();
     }
     let mut out = Vec::new();
-    while i < words.len() {
-        match members.iter().find(|a| a.answers_to(&words[i])) {
+    while i < raw.len() {
+        match members.iter().find(|a| a.answers_to(&word(raw[i]))) {
             Some(a) => {
                 if !out.contains(&a.id) {
                     out.push(a.id.clone());
                 }
+                if addressed(raw[i]) {
+                    return out; // "Codex, …" / "Claude and Codex, …"
+                }
                 i += 1;
-                if i < words.len() && words[i] == "and" {
+                if i < raw.len() && word(raw[i]) == "and" {
                     i += 1;
                     continue;
                 }
-                break;
+                return Vec::new(); // a name, but not talking to it ("Codex is slow today")
             }
-            None => break,
+            None => return Vec::new(),
         }
     }
-    out
+    Vec::new()
 }
 
 fn mention_tokens(text: &str) -> Vec<String> {
@@ -1738,6 +1740,12 @@ mod tests {
         assert_eq!(user_mentions("Hey Claude and Codex, status?", &m), vec!["a".to_string(), "b".to_string()]);
         assert_eq!(user_mentions("Everyone, what are you doing?", &m).len(), 2);
         assert!(user_mentions("Run the tests and tell codex later", &m).is_empty());
+        // Not an address: these go to the main agent only.
+        assert!(user_mentions("All right, that's good.", &m).is_empty());
+        assert!(user_mentions("All good, next step please", &m).is_empty());
+        assert!(user_mentions("Codex is slow today", &m).is_empty());
+        assert!(user_mentions("Team work makes the dream work.", &m).is_empty());
+        assert_eq!(user_mentions("Team: quick status?", &m).len(), 2);
     }
 
     /// Real processes: a lead that delegates to a helper, then wraps up.
