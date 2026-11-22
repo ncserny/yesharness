@@ -187,6 +187,24 @@ impl Shared {
     }
 }
 
+/// Starts the channel's main agent ahead of time (Claude only), so its next answer doesn't wait for the
+/// `claude` command to boot. Called when you start talking, when a channel opens, and after its turns.
+pub fn prewarm(shared: &Arc<Shared>, cid: &str) {
+    let (lead, folder, sessions) = {
+        let data = shared.data.lock().unwrap();
+        let Some(ch) = data.channel(cid) else { return };
+        let Some(lead) = data.members(ch).into_iter().next() else { return };
+        (lead, PathBuf::from(&ch.folder), ch.sessions.clone())
+    };
+    let Some(eff) = shared.effective(&lead) else { return };
+    if eff.kind != AgentKind::Claude {
+        return;
+    }
+    let model = probe::pick_model(&eff, shared.health_of(&eff).as_ref());
+    let session = sessions.get(&session_key(&eff)).cloned();
+    agents::prewarm_claude(&eff, &folder, session.as_deref(), model.as_deref());
+}
+
 /// Called by the UI when you hit send (or stop talking).
 pub fn send(shared: &Arc<Shared>, cid: &str, text: String) {
     send_with(shared, cid, text, Vec::new());
@@ -789,6 +807,11 @@ fn turn_inst(shared: &Arc<Shared>, cid: &str, agent_id: &str, mode: Mode, turns:
         if let Some(ch) = data.channel_mut(cid) {
             if let (Some(s), 0) = (&out.session, inst) {
                 ch.sessions.insert(session_key(&eff), s.clone());
+            }
+            // The main agent will answer again soon: start its next process now (see agents::prewarm_claude).
+            if inst == 0 && is_main && eff.kind == AgentKind::Claude {
+                let (s, c) = (shared.clone(), cid.to_string());
+                std::thread::spawn(move || prewarm(&s, &c));
             }
             ch.messages.push(Message {
                 author: Author::Agent(agent.id.clone()),

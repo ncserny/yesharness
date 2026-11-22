@@ -53,6 +53,8 @@ pub struct App {
     about: Option<AboutYou>,
     /// When you last typed (always-listening ignores the mic meanwhile: keyboard clicks aren't speech).
     last_typed: Option<Instant>,
+    /// When the main agent was last started ahead of time (orchestrator::prewarm).
+    last_prewarm: Option<Instant>,
     /// The first-run welcome (Alex asks a few questions out loud).
     welcome: Option<crate::welcome::Welcome>,
     /// Slide-out on the right: a file (TASKS.md, AGENTS.md) or the docs folder.
@@ -237,6 +239,7 @@ impl App {
             renaming: None,
             about: None,
             last_typed: None,
+            last_prewarm: None,
             welcome: None,
             panel: None,
             last_save: Instant::now(),
@@ -455,6 +458,17 @@ impl App {
         let mut st = d.state.lock().unwrap();
         let mut out = Vec::new();
 
+        // You started talking: get the main agent ready meanwhile (it takes a few seconds to start).
+        if !st.text.is_empty() && self.welcome.is_none() && self.last_prewarm.is_none_or(|t| t.elapsed() > Duration::from_secs(4)) {
+            self.last_prewarm = Some(Instant::now());
+            let sel = self.shared.data.lock().unwrap().selected.clone();
+            if let Some(cid) = sel {
+                if !self.shared.runs.lock().unwrap().contains_key(&cid) {
+                    let s = self.shared.clone();
+                    std::thread::spawn(move || orchestrator::prewarm(&s, &cid));
+                }
+            }
+        }
         // You started talking while an agent speaks: it stops and listens (barge-in).
         if voice::interrupts(&st.text) || (voice::speaking() && st.utterances.iter().any(|u| voice::interrupts(u))) {
             voice::stop_speaking();
@@ -587,6 +601,14 @@ impl eframe::App for App {
         }
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Key { pressed: true, .. }))) {
             self.last_typed = Some(Instant::now());
+            // Typing a message: get the main agent ready meanwhile.
+            if !self.input.trim().is_empty() && self.last_prewarm.is_none_or(|t| t.elapsed() > Duration::from_secs(4)) {
+                self.last_prewarm = Some(Instant::now());
+                if let Some(cid) = self.shared.data.lock().unwrap().selected.clone() {
+                    let s = self.shared.clone();
+                    std::thread::spawn(move || orchestrator::prewarm(&s, &cid));
+                }
+            }
         }
         if self.welcome_ui(ctx) {
             return;
@@ -1283,6 +1305,7 @@ impl App {
         }
         voice::stop_speaking();
         crate::localvoice::stop();
+        crate::agents::stop_warm();
         self.dictation = None;
         self.save_if_needed(true);
     }

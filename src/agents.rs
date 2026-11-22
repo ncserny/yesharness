@@ -111,12 +111,19 @@ pub fn run(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, mo
 
 // ---------------------------------------------------------------- Claude Code
 
-fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, model: Option<&str>, ctl: &Ctl) -> Outcome {
+/// The `claude` command for a turn. `prompt: None` = streaming input (the prompt comes on stdin later).
+fn claude_cmd(agent: &Agent, folder: &Path, prompt: Option<&str>, session: Option<&str>, model: Option<&str>) -> Command {
     let mut cmd = env::command("claude");
-    cmd.current_dir(folder)
-        .arg("-p")
-        .arg(prompt)
-        .args(["--output-format", "stream-json", "--verbose"])
+    cmd.current_dir(folder).arg("-p");
+    match prompt {
+        Some(p) => {
+            cmd.arg(p);
+        }
+        None => {
+            cmd.args(["--input-format", "stream-json"]);
+        }
+    }
+    cmd.args(["--output-format", "stream-json", "--verbose"])
         .args(["--permission-mode", if agent.full_access { "bypassPermissions" } else { "acceptEdits" }]);
     if let Some(s) = session {
         cmd.args(["--resume", s]);
@@ -143,13 +150,115 @@ fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>,
     }
     // Step limit (each step re-sends the conversation).
     cmd.args(["--max-turns", &agent.step_cap().to_string()]);
+    cmd
+}
 
-    let mut p = ClaudeParser::default();
-    let res = stream(cmd, None, ctl, |line| {
-        if let Some(st) = p.feed(line) {
-            (ctl.status)(st);
+// ---------------------------------------------------------------- a warm Claude for the main agent
+//
+// Starting the `claude` command takes 3-5 s before it even thinks. So the main agent's next process is
+// started ahead of time (when you start talking, and after each of its turns) and waits for its prompt on
+// stdin; your question then goes straight to a process that's ready.
+
+struct Warm {
+    key: String,
+    child: std::process::Child,
+    watchdog: Option<std::process::Child>,
+    started: std::time::Instant,
+}
+
+static WARM: Mutex<Option<Warm>> = Mutex::new(None);
+/// A warm process older than this is replaced (logins and settings can change).
+const WARM_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn warm_key(agent: &Agent, folder: &Path, session: Option<&str>, model: Option<&str>) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        agent.id,
+        folder.display(),
+        session.unwrap_or(""),
+        model.unwrap_or(""),
+        agent.effort,
+        agent.full_access,
+        agent.internet,
+        agent.use_my_plugins,
+        agent.step_cap()
+    )
+}
+
+fn kill_warm(w: Warm) {
+    let mut w = w;
+    let _ = w.child.kill();
+    let _ = w.child.wait();
+    if let Some(mut g) = w.watchdog {
+        let _ = g.kill();
+        let _ = g.wait();
+    }
+}
+
+/// Starts the main agent's next Claude process now, so the next turn doesn't wait for it to boot.
+pub fn prewarm_claude(agent: &Agent, folder: &Path, session: Option<&str>, model: Option<&str>) {
+    if agent.kind != AgentKind::Claude || !folder.is_dir() {
+        return;
+    }
+    let key = warm_key(agent, folder, session, model);
+    let mut w = WARM.lock().unwrap();
+    if let Some(cur) = w.as_mut() {
+        let alive = matches!(cur.child.try_wait(), Ok(None));
+        if cur.key == key && alive && cur.started.elapsed() < WARM_MAX_AGE {
+            return;
         }
-    });
+    }
+    if let Some(old) = w.take() {
+        kill_warm(old);
+    }
+    let mut cmd = claude_cmd(agent, folder, None, session, model);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Ok(child) = cmd.spawn() {
+        let watchdog = env::guard(child.id());
+        *w = Some(Warm { key, child, watchdog, started: std::time::Instant::now() });
+    }
+}
+
+/// The warm process for exactly this turn, if there is one (and it's still running).
+fn take_warm(key: &str) -> Option<std::process::Child> {
+    let mut w = WARM.lock().unwrap();
+    let cur = w.as_mut()?;
+    if cur.key != key || !matches!(cur.child.try_wait(), Ok(None)) || cur.started.elapsed() >= WARM_MAX_AGE {
+        return None;
+    }
+    let mut taken = w.take()?;
+    if let Some(mut g) = taken.watchdog.take() {
+        let _ = g.kill(); // stream() puts its own watchdog on it
+        let _ = g.wait();
+    }
+    Some(taken.child)
+}
+
+pub fn stop_warm() {
+    if let Some(w) = WARM.lock().unwrap().take() {
+        kill_warm(w);
+    }
+}
+
+fn run_claude(agent: &Agent, folder: &Path, prompt: &str, session: Option<&str>, model: Option<&str>, ctl: &Ctl) -> Outcome {
+    let key = warm_key(agent, folder, session, model);
+    let mut p = ClaudeParser::default();
+    let res = if let Some(child) = take_warm(&key) {
+        // Already booted: hand it the prompt as a stream-json message, then end its input.
+        let msg = serde_json::json!({ "type": "user", "message": { "role": "user", "content": prompt } }).to_string() + "\n";
+        stream_child(child, Some(msg), ctl, |line| {
+            if let Some(st) = p.feed(line) {
+                (ctl.status)(st);
+            }
+        })
+    } else {
+        let cmd = claude_cmd(agent, folder, Some(prompt), session, model);
+        stream(cmd, None, ctl, |line| {
+            if let Some(st) = p.feed(line) {
+                (ctl.status)(st);
+            }
+        })
+    };
     let mut receipt = p.receipt.clone();
     receipt.blocked = p.denied;
     let mut out = finish("claude", res, p.session, p.result.or(p.last_text), p.is_error, p.denied, ctl);
@@ -505,20 +614,30 @@ fn run_custom(agent: &Agent, folder: &Path, prompt: &str, ctl: &Ctl) -> Outcome 
 // ---------------------------------------------------------------- process plumbing
 
 /// Spawns `cmd`, feeds stdin, calls `on_line` for each stdout line. Returns (success, stderr).
-fn stream(mut cmd: Command, stdin: Option<String>, ctl: &Ctl, mut on_line: impl FnMut(&str)) -> Result<(bool, String), String> {
+fn stream(mut cmd: Command, stdin: Option<String>, ctl: &Ctl, on_line: impl FnMut(&str)) -> Result<(bool, String), String> {
     if ctl.cancel.load(Ordering::Relaxed) {
         return Err("(stopped)".into());
     }
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| {
+    let child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("Couldn't find `{}` on your PATH.", cmd.get_program().to_string_lossy())
         } else {
             format!("Couldn't start `{}`: {e}", cmd.get_program().to_string_lossy())
         }
     })?;
+    stream_child(child, stdin, ctl, on_line)
+}
+
+/// Feeds `stdin` to a running process and reads its output lines until it exits (or the turn is stopped).
+fn stream_child(mut child: std::process::Child, stdin: Option<String>, ctl: &Ctl, mut on_line: impl FnMut(&str)) -> Result<(bool, String), String> {
+    if ctl.cancel.load(Ordering::Relaxed) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("(stopped)".into());
+    }
     *ctl.pid.lock().unwrap() = Some(child.id());
     let mut watchdog = env::guard(child.id());
 
