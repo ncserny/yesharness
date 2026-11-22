@@ -93,9 +93,18 @@ fn headless(texts: &[String]) {
     let mut printed = 0;
     // YH_ATTACH=/path/image.png: attach an image to the first message (testing).
     let mut attach: Vec<String> = std::env::var("YH_ATTACH").ok().into_iter().collect();
-    for text in texts {
+    // YH_ASK_GAP=4: wait like a person between questions (lets the main agent warm up), and print timings.
+    let gap = std::env::var("YH_ASK_GAP").ok().and_then(|g| g.parse::<u64>().ok());
+    for (i, text) in texts.iter().enumerate() {
+        if let (Some(g), true) = (gap, i > 0) {
+            std::thread::sleep(std::time::Duration::from_secs(g));
+        }
+        let t = std::time::Instant::now();
         orchestrator::send_with(&shared, &cid, text.to_string(), std::mem::take(&mut attach));
         printed = print_until_idle(&shared, &cid, printed);
+        if gap.is_some() {
+            eprintln!("  ⏱ answered in {:.1}s", t.elapsed().as_secs_f32());
+        }
     }
 }
 
